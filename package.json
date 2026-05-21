@@ -1,0 +1,21 @@
+{
+  "name": "@signalsandsorcery/drum-generator",
+  "version": "1.0.0",
+  "description": "AI-powered drum-pattern MIDI generation with a built-in sample-based drum sampler",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch"
+  },
+  "dependencies": {
+    "@signalsandsorcery/plugin-sdk": "file:../sas-plugin-sdk"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  },
+  "license": "MIT"
+}

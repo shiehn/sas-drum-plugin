@@ -1,0 +1,14 @@
+{
+  "id": "@signalsandsorcery/drum-generator",
+  "displayName": "Drums",
+  "version": "1.0.0",
+  "description": "AI-powered drum-pattern MIDI generation with a built-in sample-based drum sampler",
+  "generatorType": "midi",
+  "main": "index.js",
+  "author": "Signals & Sorcery",
+  "minHostVersion": "1.0.0",
+  "builtIn": true,
+  "capabilities": {
+    "requiresLLM": true
+  }
+}
