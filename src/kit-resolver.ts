@@ -31,14 +31,17 @@ export type SampleRootSource = string | (() => Promise<string | null>);
 
 export interface KitResolver {
   /**
-   * Pick a random WAV path for the given role (= folder name). If
-   * `excludePath` is provided AND the role's pool has more than one
-   * candidate, that path is filtered out — used by shuffle so the user
-   * hears a different sample on each click.
+   * Pick a random WAV path for the given role (= folder name), excluding
+   * any path in `excludePaths`. Returns `null` if the filtered pool is
+   * empty — caller treats null as a signal to reset its shuffle history
+   * and call again with an empty Set. Also returns null if the role
+   * is unknown.
    *
-   * Returns `null` if the role is unknown or empty.
+   * `excludePaths` defaults to an empty Set, matching the natural "give
+   * me any random one" semantics. The panel's shuffle history is the
+   * typical input here.
    */
-  pick(role: string, excludePath?: string): Promise<string | null>;
+  pick(role: string, excludePaths?: ReadonlySet<string>): Promise<string | null>;
 
   /**
    * The list of role names (= folder names) discovered under the library
@@ -100,7 +103,7 @@ export function createKitResolver(host: PluginHost, root: SampleRootSource = DEF
     return listingPromise;
   }
 
-  async function pick(role: string, excludePath?: string): Promise<string | null> {
+  async function pick(role: string, excludePaths?: ReadonlySet<string>): Promise<string | null> {
     if (!role) return null;
 
     let byFolder: Map<string, string[]>;
@@ -114,9 +117,10 @@ export function createKitResolver(host: PluginHost, root: SampleRootSource = DEF
     const pool = byFolder.get(role);
     if (!pool || pool.length === 0) return null;
 
-    const filtered = (excludePath && pool.length > 1)
-      ? pool.filter(p => p !== excludePath)
+    const filtered = excludePaths && excludePaths.size > 0
+      ? pool.filter(p => !excludePaths.has(p))
       : pool;
+    if (filtered.length === 0) return null;
     const idx = Math.floor(Math.random() * filtered.length);
     return filtered[idx] ?? null;
   }

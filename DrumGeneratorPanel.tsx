@@ -43,6 +43,15 @@ interface DrumTrackState {
   // Phase 0.8: subRole removed — folder name IS the role now (flat taxonomy).
   // The track.role field carries the full folder name (e.g. "kick", "hat-closed").
   samplePath: string | null;
+  /**
+   * Per-track shuffle history. Set of sample paths the shuffle button
+   * has already handed back since the track was created OR since the
+   * history was last reset (which happens automatically when the role's
+   * pool is exhausted, so the cycle wraps and starts over). Generate
+   * also seeds the history with its initial random pick so the next
+   * shuffle gives a different sample.
+   */
+  shuffleHistory: Set<string>;
   runtimeState: PluginTrackRuntimeState;
   fxDetailState: TrackFxDetailState;
   fxDrawerOpen: boolean;
@@ -211,6 +220,7 @@ export function DrumGeneratorPanel({
           prompt,
           role: handle.role ?? '',
           samplePath,
+          shuffleHistory: samplePath ? new Set<string>([samplePath]) : new Set<string>(),
           runtimeState,
           fxDetailState,
           fxDrawerOpen: false,
@@ -370,6 +380,7 @@ export function DrumGeneratorPanel({
         prompt: '',
         role: '',
         samplePath: null,
+        shuffleHistory: new Set<string>(),
         runtimeState: { id: handle.id, muted: false, solo: false, volume: 0.75, pan: 0 },
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
         fxDrawerOpen: false,
@@ -610,11 +621,16 @@ export function DrumGeneratorPanel({
 
       // Pick a sample and load the drum sampler. Don't overwrite an explicit
       // user-chosen instrument (e.g. user picked a custom sampler manually).
-      // Phase 0.8: kitResolver.pick now takes (role, excludePath) — role IS
-      // the folder, no subRole intermediary.
+      // Phase 0.8: kitResolver.pick takes (role, excludePaths) where role IS
+      // the folder. Excluding the current samplePath gives an actual swap
+      // on regenerate; not strictly required since the random pick has a
+      // 1/N chance of being the same anyway, but cleaner.
       let newSamplePath = track.samplePath;
+      const currentExclude: ReadonlySet<string> = track.samplePath
+        ? new Set<string>([track.samplePath])
+        : new Set<string>();
       if (!track.instrumentPluginId && newRole) {
-        const picked = await kitResolver.pick(newRole, track.samplePath ?? undefined);
+        const picked = await kitResolver.pick(newRole, currentExclude);
         if (picked) {
           newSamplePath = picked;
           if (activeSceneId) {
@@ -628,9 +644,13 @@ export function DrumGeneratorPanel({
         }
       }
 
+      // Generate begins a fresh shuffle cycle — seed the history with the
+      // sample we just picked so the next shuffle won't return the same one.
+      const freshHistory = newSamplePath ? new Set<string>([newSamplePath]) : new Set<string>();
+
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId
-          ? { ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath, hasMidi: true, generationProgress: 0 }
+          ? { ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath, hasMidi: true, generationProgress: 0, shuffleHistory: freshHistory }
           : t
       ));
       host.showToast('success', 'Drum pattern generated');
@@ -686,10 +706,12 @@ export function DrumGeneratorPanel({
     host.setTrackPan(trackId, pan).catch(() => {});
   }, [host]);
 
-  // --- Shuffle: re-pick a sample within the same role ---
-  // Phase 0.8: subRole removed; role IS the folder, kitResolver.pick takes
-  // (role, excludePath) directly. excludePath ensures shuffle returns a
-  // different sample on each click (when the role's pool has > 1 entry).
+  // --- Shuffle: cycle through every sample in the role before repeating ---
+  // Each track maintains a per-track shuffleHistory Set of already-used
+  // sample paths. We pass it to kitResolver.pick as the excludePaths; when
+  // the filtered pool is empty (== all samples used), we reset the history
+  // and pick again. After a successful pick we add the new path to the
+  // (fresh-or-existing) history and store it on the track.
   const handleShuffle = useCallback(async (trackId: string): Promise<void> => {
     const track = tracks.find(t => t.handle.id === trackId);
     if (!track) return;
@@ -699,24 +721,35 @@ export function DrumGeneratorPanel({
       return;
     }
     try {
-      const picked = await kitResolver.pick(role, track.samplePath ?? undefined);
+      const history = track.shuffleHistory;
+      let picked = await kitResolver.pick(role, history);
+      let nextHistory: Set<string>;
+      if (!picked) {
+        // Pool exhausted — reset the deck and pick from the full pool
+        nextHistory = new Set<string>();
+        picked = await kitResolver.pick(role, nextHistory);
+      } else {
+        nextHistory = new Set(history);
+      }
       if (!picked) {
         host.showToast('warning', 'Shuffle skipped', 'No samples available for this role');
         return;
       }
+      nextHistory.add(picked);
+
       const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       if (activeSceneId) {
         host.setSceneData(activeSceneId, `track:${dbId}:samplePath`, picked).catch(() => {});
       }
       await host.setTrackDrumKit(trackId, { samplePath: picked });
       setTracks(prev => prev.map(t =>
-        t.handle.id === trackId ? { ...t, samplePath: picked } : t
+        t.handle.id === trackId ? { ...t, samplePath: picked, shuffleHistory: nextHistory } : t
       ));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host, tracks, activeSceneId]);
+  }, [host, tracks, activeSceneId, kitResolver]);
 
   // --- Duplicate track --------------------------------------------------
   const handleCopy = useCallback(async (trackId: string): Promise<void> => {
