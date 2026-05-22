@@ -24,7 +24,11 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow, useSceneState, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
-import { isDrumRole } from './src/role-mapping';
+// Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
+// — the previous hardcoded role-mapping.ts has been retired (kept only as a
+// tombstone module). The drum panel fetches the live role list at mount and
+// passes it to buildDrumSystemPrompt so the LLM is constrained to whatever
+// folders actually exist under the library root.
 import { createKitResolver } from './src/kit-resolver';
 
 const MAX_TRACKS = 16;
@@ -36,7 +40,8 @@ interface DrumTrackState {
   handle: PluginTrackHandle;
   prompt: string;
   role: string;
-  subRole: string;
+  // Phase 0.8: subRole removed — folder name IS the role now (flat taxonomy).
+  // The track.role field carries the full folder name (e.g. "kick", "hat-closed").
   samplePath: string | null;
   runtimeState: PluginTrackRuntimeState;
   fxDetailState: TrackFxDetailState;
@@ -55,7 +60,7 @@ interface DrumTrackState {
 interface LLMDrumResponse {
   notes: PluginMidiNote[];
   role?: string;
-  subRole?: string;
+  // subRole removed in Phase 0.8 — role is the folder name (flat taxonomy)
 }
 
 export function DrumGeneratorPanel({
@@ -78,7 +83,27 @@ export function DrumGeneratorPanel({
   const [availableInstruments, setAvailableInstruments] = useState<InstrumentDescriptor[]>([]);
   const [instrumentsLoading, setInstrumentsLoading] = useState(false);
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
-  const [kitResolver] = useState(() => createKitResolver(host));
+  const [kitResolver] = useState(() =>
+    createKitResolver(host, () => host.getBundledResourcePath('drum-samples')),
+  );
+
+  // Phase 0.8: live drum-role vocabulary discovered from the library FS.
+  // Populated by an effect on mount + when the resolver gets reset; fed
+  // into buildDrumSystemPrompt(...) so the LLM is constrained to actual
+  // on-disk folder names. Empty until the first scan completes.
+  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const roles = await kitResolver.getDiscoveredRoles();
+        if (!cancelled) setAvailableRoles(roles);
+      } catch (err) {
+        console.warn('[DrumGeneratorPanel] Failed to discover drum roles:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kitResolver]);
 
   // --- Load tracks when scene changes -----------------------------------
   const tracksLoadedForSceneRef = useRef<string | null>(null);
@@ -143,7 +168,6 @@ export function DrumGeneratorPanel({
         }
 
         const promptKey = `track:${handle.dbId}:prompt`;
-        const subRoleKey = `track:${handle.dbId}:subRole`;
         const samplePathKey = `track:${handle.dbId}:samplePath`;
 
         let prompt = typeof sceneData[promptKey] === 'string' ? sceneData[promptKey] as string : '';
@@ -152,8 +176,10 @@ export function DrumGeneratorPanel({
           host.setSceneData(sceneAtStart, promptKey, prompt).catch(() => {});
         }
 
-        const subRole = typeof sceneData[subRoleKey] === 'string' ? sceneData[subRoleKey] as string : '';
         const samplePath = typeof sceneData[samplePathKey] === 'string' ? sceneData[samplePathKey] as string : null;
+        // subRole scene data no longer read in Phase 0.8 — folder name IS the role.
+        // Old subRole rows in scene data are left in place harmlessly; they'll be
+        // garbage-collected when the track is deleted (deleteTrack drops the row).
 
         if (!hasMidi && handle.role) {
           hasMidi = true;
@@ -184,7 +210,6 @@ export function DrumGeneratorPanel({
           handle,
           prompt,
           role: handle.role ?? '',
-          subRole,
           samplePath,
           runtimeState,
           fxDetailState,
@@ -344,7 +369,6 @@ export function DrumGeneratorPanel({
         handle,
         prompt: '',
         role: '',
-        subRole: '',
         samplePath: null,
         runtimeState: { id: handle.id, muted: false, solo: false, volume: 0.75, pan: 0 },
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
@@ -463,7 +487,8 @@ export function DrumGeneratorPanel({
       const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       if (activeSceneId) {
         await host.deleteSceneData(activeSceneId, `track:${dbId}:prompt`);
-        await host.deleteSceneData(activeSceneId, `track:${dbId}:subRole`);
+        // Drop any legacy subRole row left over from pre-Phase 0.8 tracks.
+        await host.deleteSceneData(activeSceneId, `track:${dbId}:subRole`).catch(() => {});
         await host.deleteSceneData(activeSceneId, `track:${dbId}:samplePath`);
       }
       setTracks(prev => prev.filter(t => t.handle.id !== trackId));
@@ -523,7 +548,10 @@ export function DrumGeneratorPanel({
       const userPrompt = promptParts.join('\n');
 
       const llmResult = await host.generateWithLLM({
-        system: buildDrumSystemPrompt(),
+        // Phase 0.8: roles are FS-discovered now. Pass the live list so the
+        // LLM picks from real on-disk folder names (e.g. "kick", "hat-closed")
+        // instead of the old grouped taxonomy ("kicks", "hats", ...).
+        system: buildDrumSystemPrompt(availableRoles),
         user: userPrompt,
         responseFormat: 'json',
       });
@@ -563,14 +591,16 @@ export function DrumGeneratorPanel({
       await host.writeMidiClip(trackId, clipData);
 
       const genDbId = engineToDbIdRef.current.get(trackId) ?? trackId;
-      const newRole = (parsed.role && isDrumRole(parsed.role)) ? parsed.role : (track.role || 'perc');
-      const newSubRole = parsed.subRole ?? '';
+      // Validate the LLM-emitted role against the live FS-discovered list
+      // (Phase 0.8). Fall back to current track role if the LLM hallucinated;
+      // last-resort fallback to the first available role if both are empty.
+      const fallbackRole = track.role || availableRoles[0] || '';
+      const newRole = (parsed.role && availableRoles.includes(parsed.role)) ? parsed.role : fallbackRole;
 
-      if (activeSceneId) {
+      if (activeSceneId && newRole) {
         host.setSceneData(activeSceneId, `track:${genDbId}:role`, newRole).catch(() => {});
-        host.setSceneData(activeSceneId, `track:${genDbId}:subRole`, newSubRole).catch(() => {});
       }
-      if (newRole !== track.role) {
+      if (newRole && newRole !== track.role) {
         try {
           await host.setTrackRole(trackId, newRole);
         } catch (err) {
@@ -580,9 +610,11 @@ export function DrumGeneratorPanel({
 
       // Pick a sample and load the drum sampler. Don't overwrite an explicit
       // user-chosen instrument (e.g. user picked a custom sampler manually).
+      // Phase 0.8: kitResolver.pick now takes (role, excludePath) — role IS
+      // the folder, no subRole intermediary.
       let newSamplePath = track.samplePath;
-      if (!track.instrumentPluginId) {
-        const picked = await kitResolver.pick(newRole, newSubRole || undefined);
+      if (!track.instrumentPluginId && newRole) {
+        const picked = await kitResolver.pick(newRole, track.samplePath ?? undefined);
         if (picked) {
           newSamplePath = picked;
           if (activeSceneId) {
@@ -598,7 +630,7 @@ export function DrumGeneratorPanel({
 
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId
-          ? { ...t, isGenerating: false, error: null, role: newRole, subRole: newSubRole, samplePath: newSamplePath, hasMidi: true, generationProgress: 0 }
+          ? { ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath, hasMidi: true, generationProgress: 0 }
           : t
       ));
       host.showToast('success', 'Drum pattern generated');
@@ -609,7 +641,7 @@ export function DrumGeneratorPanel({
       ));
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, activeSceneId]);
+  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver]);
 
   // --- Mute/Solo/Volume/Pan -----------------------------------------------
   const handleMuteToggle = useCallback((trackId: string): void => {
@@ -654,14 +686,20 @@ export function DrumGeneratorPanel({
     host.setTrackPan(trackId, pan).catch(() => {});
   }, [host]);
 
-  // --- Shuffle: re-pick a sample within the same role / subRole ---------
+  // --- Shuffle: re-pick a sample within the same role ---
+  // Phase 0.8: subRole removed; role IS the folder, kitResolver.pick takes
+  // (role, excludePath) directly. excludePath ensures shuffle returns a
+  // different sample on each click (when the role's pool has > 1 entry).
   const handleShuffle = useCallback(async (trackId: string): Promise<void> => {
     const track = tracks.find(t => t.handle.id === trackId);
     if (!track) return;
-    const role = track.role || 'perc';
-    const subRole = track.subRole || undefined;
+    const role = track.role;
+    if (!role) {
+      host.showToast('warning', 'Shuffle skipped', 'Generate first to set the role');
+      return;
+    }
     try {
-      const picked = await kitResolver.pick(role, subRole, track.samplePath ?? undefined);
+      const picked = await kitResolver.pick(role, track.samplePath ?? undefined);
       if (!picked) {
         host.showToast('warning', 'Shuffle skipped', 'No samples available for this role');
         return;
@@ -993,17 +1031,14 @@ export function DrumGeneratorPanel({
         onProgressChange={(pct: number) => handleProgressChange(track.handle.id, pct)}
         accentColor={DRUM_ACCENT_COLOR}
         instrumentName={track.instrumentName ?? (track.samplePath ? sampleNameForDisplay(track.samplePath) : null)}
-        instrumentMissing={track.instrumentMissing}
-        instrumentDrawerOpen={track.instrumentDrawerOpen}
-        onToggleInstrumentDrawer={() => toggleInstrumentDrawer(track.handle.id)}
-        availableInstruments={availableInstruments}
-        currentInstrumentPluginId={track.instrumentPluginId}
-        onInstrumentSelect={(pluginId: string) => handleInstrumentSelect(track.handle.id, pluginId)}
-        instrumentsLoading={instrumentsLoading}
-        onRefreshInstruments={handleRefreshInstruments}
-        instrumentDrawerStage={track.instrumentDrawerStage}
-        onShowEditor={() => handleShowEditor(track.handle.id)}
-        onBackToInstruments={() => handleBackToInstruments(track.handle.id)}
+        // Drum tracks are pinned to the built-in sampler — the user can't pick a
+        // different instrument plugin. Omitting onToggleInstrumentDrawer (per the
+        // SDK's TrackRow contract) hides the "P" button entirely; the remaining
+        // instrument-drawer props (availableInstruments, currentInstrumentPluginId,
+        // instrumentDrawerOpen/Stage, onInstrumentSelect, onShowEditor, etc.)
+        // would be dead without that toggle, so they're dropped too. The
+        // instrumentName display above is kept — it still shows which sample
+        // is loaded as a passive label.
       />
     );
   }
@@ -1072,9 +1107,11 @@ function parseLLMDrumResponse(content: string): LLMDrumResponse | null {
     }
 
     const role = typeof obj.role === 'string' ? obj.role : undefined;
-    const subRole = typeof obj.subRole === 'string' ? obj.subRole : undefined;
+    // subRole removed in Phase 0.8 — if the LLM still emits one (drift while
+    // the prompt change propagates), we ignore it; the role field now carries
+    // the literal folder name.
 
-    return { notes: validNotes, role, subRole };
+    return { notes: validNotes, role };
   } catch {
     return null;
   }

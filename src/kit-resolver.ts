@@ -1,41 +1,72 @@
 /**
- * Kit resolver — picks a random WAV sample from the configured drum
- * library for a given (role, subRole) pair.
+ * Kit resolver — picks a random WAV from the configured drum library
+ * for a given role. Phase 0.8 redesign: roles are flat (each folder under
+ * the library root IS a role) and discovered from the filesystem on first
+ * load, rather than mapped through a hardcoded role-mapping table.
  *
- * The library lives at `DEFAULT_SAMPLE_ROOT` for the prototype. Inside
- * that root, samples are organised in 14 folders (see role-mapping.ts).
- * Future work can move this under app-data or make it user-configurable.
+ * The root path can be supplied directly (string) or lazily resolved via
+ * an async function — the latter is how the in-repo built-in passes the
+ * bundled resources path, which depends on `app.isPackaged` and must be
+ * resolved in main.
  *
  * File listing happens once, lazily, via `host.listAudioFiles`, then is
  * cached for the lifetime of the resolver. Calling `reset()` forces
  * a re-scan (used when the sample library content changes underneath).
+ *
+ * The discovered-role list (computed from the same cache) is what the
+ * drum panel hands to buildDrumSystemPrompt at generate time, so the
+ * LLM's role vocabulary always matches what's actually on disk.
  */
 
 import type { PluginHost } from '@signalsandsorcery/plugin-sdk';
-import { foldersForRole, folderForSubRole } from './role-mapping';
 
+/**
+ * Fallback root used when no override is provided AND the host can't
+ * resolve a bundled path. Kept for backwards-compat with the prototype;
+ * in production the in-repo plugin passes a runtime-resolved path.
+ */
 export const DEFAULT_SAMPLE_ROOT = '/Users/stevehiehn/Downloads/outputs/processed';
+
+export type SampleRootSource = string | (() => Promise<string | null>);
 
 export interface KitResolver {
   /**
-   * Pick a random WAV path for the given canonical `role`, optionally
-   * preferring the folder hinted by `subRole`. If `excludePath` is
-   * provided AND more than one candidate exists, the excluded path will
-   * not be returned — used by the shuffle button so the user hears a
-   * different sample on each click.
+   * Pick a random WAV path for the given role (= folder name). If
+   * `excludePath` is provided AND the role's pool has more than one
+   * candidate, that path is filtered out — used by shuffle so the user
+   * hears a different sample on each click.
    *
-   * Returns `null` if no candidates exist (library missing or empty).
+   * Returns `null` if the role is unknown or empty.
    */
-  pick(role: string, subRole?: string, excludePath?: string): Promise<string | null>;
+  pick(role: string, excludePath?: string): Promise<string | null>;
 
-  /** Force a re-scan of the library on the next pick. */
+  /**
+   * The list of role names (= folder names) discovered under the library
+   * root. Phase 0.8 — drum-system-prompt receives this list and bakes it
+   * into the LLM prompt so the LLM is constrained to the actual on-disk
+   * vocabulary. Empty if the library hasn't been scanned yet OR the root
+   * doesn't exist.
+   */
+  getDiscoveredRoles(): Promise<string[]>;
+
+  /** Force a re-scan of the library on the next pick / getDiscoveredRoles. */
   reset(): void;
 }
 
-export function createKitResolver(host: PluginHost, rootPath: string = DEFAULT_SAMPLE_ROOT): KitResolver {
+export function createKitResolver(host: PluginHost, root: SampleRootSource = DEFAULT_SAMPLE_ROOT): KitResolver {
   /** Lazily-populated map: folder name → list of absolute WAV paths. */
   let cache: Map<string, string[]> | null = null;
   let listingPromise: Promise<Map<string, string[]>> | null = null;
+
+  async function resolveRoot(): Promise<string> {
+    if (typeof root === 'string') return root;
+    const resolved = await root();
+    if (resolved && resolved.length > 0) return resolved;
+    // Host couldn't resolve (e.g. mocked Electron in tests) — fall back to
+    // the prototype path. listAudioFiles will return [] if it doesn't
+    // exist, which the rest of the resolver handles cleanly.
+    return DEFAULT_SAMPLE_ROOT;
+  }
 
   async function getCache(): Promise<Map<string, string[]>> {
     if (cache) return cache;
@@ -43,6 +74,7 @@ export function createKitResolver(host: PluginHost, rootPath: string = DEFAULT_S
 
     listingPromise = (async () => {
       try {
+        const rootPath = await resolveRoot();
         const paths = await host.listAudioFiles(rootPath, { extensions: ['.wav'], recursive: true });
         const byFolder = new Map<string, string[]>();
         for (const p of paths) {
@@ -68,31 +100,20 @@ export function createKitResolver(host: PluginHost, rootPath: string = DEFAULT_S
     return listingPromise;
   }
 
-  async function pick(role: string, subRole?: string, excludePath?: string): Promise<string | null> {
-    const folders = await collectFolders(role, subRole);
-    if (folders.length === 0) return null;
+  async function pick(role: string, excludePath?: string): Promise<string | null> {
+    if (!role) return null;
 
     let byFolder: Map<string, string[]>;
     try {
       byFolder = await getCache();
     } catch (err: unknown) {
-      // listAudioFiles errored (disk missing, permission denied, etc.).
-      // Surface a warning but treat as "no library" — callers degrade
-      // to silent tracks rather than crashing the generate flow.
       console.warn('[kit-resolver] Failed to list samples:', err);
       return null;
     }
 
-    const pool: string[] = [];
-    for (const folder of folders) {
-      const list = byFolder.get(folder);
-      if (list && list.length > 0) {
-        pool.push(...list);
-      }
-    }
-    if (pool.length === 0) return null;
+    const pool = byFolder.get(role);
+    if (!pool || pool.length === 0) return null;
 
-    // Bias the pick to avoid `excludePath` if the pool has alternatives.
     const filtered = (excludePath && pool.length > 1)
       ? pool.filter(p => p !== excludePath)
       : pool;
@@ -100,18 +121,26 @@ export function createKitResolver(host: PluginHost, rootPath: string = DEFAULT_S
     return filtered[idx] ?? null;
   }
 
-  async function collectFolders(role: string, subRole?: string): Promise<string[]> {
-    const folder = folderForSubRole(subRole);
-    if (folder) {
-      // sub-role hint maps to a specific folder; use that exclusively
-      return [folder];
+  async function getDiscoveredRoles(): Promise<string[]> {
+    let byFolder: Map<string, string[]>;
+    try {
+      byFolder = await getCache();
+    } catch (err: unknown) {
+      console.warn('[kit-resolver] Failed to list samples for role discovery:', err);
+      return [];
     }
-    const list = foldersForRole(role);
-    return [...list];
+    // Filter out folders that contain no audio (unlikely after the walk
+    // but defensive) and skip _-prefixed admin folders consistent with the
+    // instrument-resolver convention.
+    return Array.from(byFolder.entries())
+      .filter(([folder, list]) => folder.length > 0 && !folder.startsWith('_') && list.length > 0)
+      .map(([folder]) => folder)
+      .sort();
   }
 
   return {
     pick,
+    getDiscoveredRoles,
     reset(): void {
       cache = null;
       listingPromise = null;
