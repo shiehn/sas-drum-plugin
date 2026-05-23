@@ -21,12 +21,19 @@
 import type { PluginHost } from '@signalsandsorcery/plugin-sdk';
 
 /**
- * Fallback root used when no override is provided AND the host can't
- * resolve a bundled path. Kept for backwards-compat with the prototype;
- * in production the in-repo plugin passes a runtime-resolved path.
+ * Source of the library root for createKitResolver.
+ *
+ *   - string                                 — used directly
+ *   - () => Promise<string | null>           — resolved lazily on first scan;
+ *                                              null means "no library installed"
+ *                                              (resolver returns empty/null
+ *                                              cleanly, panel should show CTA)
+ *
+ * The drum panel passes a function that calls `host.getSamplePackRoot('sas-drum-pack')`,
+ * which returns null when the sample pack isn't installed or is at a stale
+ * version. The panel guards its UI with `host.isSamplePackCurrent(...)` so
+ * the resolver is normally only consulted when the pack IS current.
  */
-export const DEFAULT_SAMPLE_ROOT = '/Users/stevehiehn/Downloads/outputs/processed';
-
 export type SampleRootSource = string | (() => Promise<string | null>);
 
 export interface KitResolver {
@@ -56,19 +63,15 @@ export interface KitResolver {
   reset(): void;
 }
 
-export function createKitResolver(host: PluginHost, root: SampleRootSource = DEFAULT_SAMPLE_ROOT): KitResolver {
+export function createKitResolver(host: PluginHost, root: SampleRootSource): KitResolver {
   /** Lazily-populated map: folder name → list of absolute WAV paths. */
   let cache: Map<string, string[]> | null = null;
   let listingPromise: Promise<Map<string, string[]>> | null = null;
 
-  async function resolveRoot(): Promise<string> {
+  async function resolveRoot(): Promise<string | null> {
     if (typeof root === 'string') return root;
     const resolved = await root();
-    if (resolved && resolved.length > 0) return resolved;
-    // Host couldn't resolve (e.g. mocked Electron in tests) — fall back to
-    // the prototype path. listAudioFiles will return [] if it doesn't
-    // exist, which the rest of the resolver handles cleanly.
-    return DEFAULT_SAMPLE_ROOT;
+    return resolved && resolved.length > 0 ? resolved : null;
   }
 
   async function getCache(): Promise<Map<string, string[]>> {
@@ -78,6 +81,10 @@ export function createKitResolver(host: PluginHost, root: SampleRootSource = DEF
     listingPromise = (async () => {
       try {
         const rootPath = await resolveRoot();
+        if (!rootPath) {
+          cache = new Map();
+          return cache;
+        }
         const paths = await host.listAudioFiles(rootPath, { extensions: ['.wav'], recursive: true });
         const byFolder = new Map<string, string[]>();
         for (const p of paths) {
