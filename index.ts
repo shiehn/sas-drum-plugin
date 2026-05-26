@@ -22,6 +22,13 @@ import drumManifest from './plugin.json';
 /** Plugin manifest (re-exported so the host registers it from the package root). */
 export { drumManifest };
 
+// Generation primitives — re-exported so the host's skill bridge
+// (plugin-skill-handlers) can drive the `generate_drums` skill without reaching
+// into the plugin's internals. These are the same modules the panel uses.
+export { buildDrumSystemPrompt } from './src/drum-system-prompt';
+export { createKitResolver } from './src/kit-resolver';
+export { parseLLMDrumResponse } from './src/parse-llm-response';
+
 export class DrumGeneratorPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/drum-generator';
   readonly displayName = 'Drums';
