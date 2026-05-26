@@ -16,7 +16,6 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
   MidiClipData,
-  PluginMidiNote,
   BulkAddPlaceholderTrack,
   InstrumentDescriptor,
   FxCategory,
@@ -30,6 +29,23 @@ import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // passes it to buildDrumSystemPrompt so the LLM is constrained to whatever
 // folders actually exist under the library root.
 import { createKitResolver } from './src/kit-resolver';
+import { parseLLMDrumResponse } from './src/parse-llm-response';
+import { SamplePackCTACard, type SamplePackCardInfo } from '@signalsandsorcery/plugin-sdk';
+
+type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
+
+// This plugin's sample-pack display identity. The HOST owns the volatile
+// registry (exact size / sha256 / download URL / expected version) keyed by
+// packId — reached via host.isSamplePackCurrent / getSamplePackRoot /
+// getSamplePackInstalledVersion / startSamplePackDownload. The plugin only
+// declares its own packId + the copy shown on the download CTA, so it no
+// longer imports the app's shared/constants/sample-packs (W9 — no back doors).
+const DRUM_PACK: SamplePackCardInfo = {
+  packId: 'sas-drum-pack',
+  displayName: 'Drum Sample Library',
+  description: 'Kicks, snares, hats, percussion — needed to generate drum tracks',
+  sizeBytes: 100_934_888,
+};
 
 const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
@@ -66,12 +82,6 @@ interface DrumTrackState {
   instrumentDrawerStage: 'instruments' | 'editor';
 }
 
-interface LLMDrumResponse {
-  notes: PluginMidiNote[];
-  role?: string;
-  // subRole removed in Phase 0.8 — role is the folder name (flat taxonomy)
-}
-
 export function DrumGeneratorPanel({
   host,
   activeSceneId,
@@ -92,16 +102,48 @@ export function DrumGeneratorPanel({
   const [availableInstruments, setAvailableInstruments] = useState<InstrumentDescriptor[]>([]);
   const [instrumentsLoading, setInstrumentsLoading] = useState(false);
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
+  // Phase 1.1 (sample pack distribution): the resolver is fed the live
+  // sample-pack root. When the pack is missing or stale, getSamplePackRoot
+  // returns null and we render the CTA card instead of the normal panel.
   const [kitResolver] = useState(() =>
-    createKitResolver(host, () => host.getBundledResourcePath('drum-samples')),
+    createKitResolver(host, () => host.getSamplePackRoot(DRUM_PACK.packId)),
   );
+
+  // Pack-status drives the empty-state vs normal-state branch. Re-evaluated
+  // on mount and after every download completes. While 'checking', the panel
+  // shows a brief loading placeholder; thereafter it's either CTA or normal UI.
+  const [packStatus, setPackStatus] = useState<PackStatus>('checking');
+  const refreshPackStatus = useCallback(async (): Promise<void> => {
+    const isCurrent = await host.isSamplePackCurrent(DRUM_PACK.packId).catch(() => false);
+    if (isCurrent) {
+      setPackStatus('current');
+      kitResolver.reset();
+      return;
+    }
+    const installed = await host
+      .getSamplePackInstalledVersion(DRUM_PACK.packId)
+      .catch(() => null);
+    setPackStatus(installed === null ? 'missing' : 'stale');
+  }, [host, kitResolver]);
+  useEffect(() => {
+    void refreshPackStatus();
+    const unsub = host.onSamplePackProgress(DRUM_PACK.packId, (p) => {
+      if (p.status === 'complete') void refreshPackStatus();
+    });
+    return unsub;
+  }, [refreshPackStatus, host]);
 
   // Phase 0.8: live drum-role vocabulary discovered from the library FS.
   // Populated by an effect on mount + when the resolver gets reset; fed
   // into buildDrumSystemPrompt(...) so the LLM is constrained to actual
-  // on-disk folder names. Empty until the first scan completes.
+  // on-disk folder names. Empty until the first scan completes. Re-scanned
+  // when packStatus flips to 'current' (e.g., right after a download).
   const [availableRoles, setAvailableRoles] = useState<string[]>([]);
   useEffect(() => {
+    if (packStatus !== 'current') {
+      setAvailableRoles([]);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -112,7 +154,7 @@ export function DrumGeneratorPanel({
       }
     })();
     return () => { cancelled = true; };
-  }, [kitResolver]);
+  }, [kitResolver, packStatus]);
 
   // --- Load tracks when scene changes -----------------------------------
   const tracksLoadedForSceneRef = useRef<string | null>(null);
@@ -454,6 +496,13 @@ export function DrumGeneratorPanel({
   const needsContract = !sceneContext?.hasContract;
   useEffect(() => {
     if (!onHeaderContent) return;
+    // Hide the "+ Add" button until the sample pack is installed — the
+    // panel body renders a CTA card in that state and adding tracks would
+    // produce silent ones (no samples to load).
+    if (packStatus !== 'current') {
+      onHeaderContent(null);
+      return () => { onHeaderContent(null); };
+    }
     const addDisabled =
       needsContract ||
       !isConnected ||
@@ -481,7 +530,7 @@ export function DrumGeneratorPanel({
       </div>
     );
     return () => { onHeaderContent(null); };
-  }, [onHeaderContent, sceneContext, isConnected, isAddingTrack,
+  }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       needsContract, activeSceneId, tracks.length, handleAddTrack, onOpenContract]);
 
   useEffect(() => {
@@ -990,6 +1039,17 @@ export function DrumGeneratorPanel({
     );
   }
 
+  if (packStatus !== 'current') {
+    return (
+      <SamplePackCTACard
+        host={host}
+        pack={DRUM_PACK}
+        status={packStatus}
+        onDownloadComplete={refreshPackStatus}
+      />
+    );
+  }
+
   return (
     <div data-testid="drum-section" className="p-2 space-y-2">
       {isLoadingTracks ? (
@@ -1094,60 +1154,6 @@ function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailSt
     }
   }
   return result;
-}
-
-function parseLLMDrumResponse(content: string): LLMDrumResponse | null {
-  try {
-    let jsonStr = content.trim();
-    const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-    if (fenceMatch) {
-      jsonStr = fenceMatch[1].trim();
-    }
-
-    const parsed: unknown = JSON.parse(jsonStr);
-    if (typeof parsed !== 'object' || parsed === null || !('notes' in parsed)) {
-      return null;
-    }
-
-    const obj = parsed as Record<string, unknown>;
-    if (!Array.isArray(obj.notes)) {
-      return null;
-    }
-
-    const validNotes: PluginMidiNote[] = [];
-    for (const raw of obj.notes) {
-      if (typeof raw !== 'object' || raw === null) continue;
-      const note = raw as Record<string, unknown>;
-
-      const pitch = typeof note.pitch === 'number' ? note.pitch : NaN;
-      const startBeat = typeof note.startBeat === 'number' ? note.startBeat : NaN;
-      const durationBeats = typeof note.durationBeats === 'number' ? note.durationBeats : NaN;
-      const velocity = typeof note.velocity === 'number' ? note.velocity : NaN;
-
-      if (
-        !isNaN(pitch) && pitch >= 0 && pitch <= 127 &&
-        !isNaN(startBeat) && startBeat >= 0 &&
-        !isNaN(durationBeats) && durationBeats > 0 &&
-        !isNaN(velocity) && velocity >= 1 && velocity <= 127
-      ) {
-        validNotes.push({
-          pitch: Math.round(pitch),
-          startBeat,
-          durationBeats,
-          velocity: Math.round(velocity),
-        });
-      }
-    }
-
-    const role = typeof obj.role === 'string' ? obj.role : undefined;
-    // subRole removed in Phase 0.8 — if the LLM still emits one (drift while
-    // the prompt change propagates), we ignore it; the role field now carries
-    // the literal folder name.
-
-    return { notes: validNotes, role };
-  } catch {
-    return null;
-  }
 }
 
 /** Pretty filename for display in the TrackRow ("kick-12345.wav" → "kick 12345"). */
