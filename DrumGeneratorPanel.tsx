@@ -21,7 +21,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, useSceneState, useSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -101,6 +101,7 @@ export function DrumGeneratorPanel({
 }: PluginUIProps): React.ReactElement {
   const [tracks, setTracks] = useState<DrumTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
   const saveTimeoutRefs = useRef<Record<string, NodeJS.Timeout>>({});
@@ -113,6 +114,23 @@ export function DrumGeneratorPanel({
   const [kitResolver] = useState(() =>
     createKitResolver(host, () => host.getSamplePackRoot(DRUM_PACK.packId)),
   );
+
+  // --- Sound history (↩ back-arrow + drawer "History" tab) --------------
+  // A drum "sound" is its sample path. Re-applying loads it into the sampler
+  // and re-persists it so a scene reopen keeps the restored sound.
+  const applyDrumSound = useCallback(
+    async (trackId: string, descriptor: unknown): Promise<void> => {
+      const samplePath = descriptor as string;
+      await host.setTrackDrumKit(trackId, { samplePath });
+      const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+      if (activeSceneId) {
+        host.setSceneData(activeSceneId, `track:${dbId}:samplePath`, samplePath).catch(() => {});
+      }
+      setTracks((prev) => prev.map((t) => (t.handle.id === trackId ? { ...t, samplePath } : t)));
+    },
+    [host, activeSceneId],
+  );
+  const soundHistory = useSoundHistory(applyDrumSound);
 
   // Pack-status drives the empty-state vs normal-state branch. Re-evaluated
   // on mount and after every download completes. While 'checking', the panel
@@ -184,6 +202,8 @@ export function DrumGeneratorPanel({
       setTracks([]);
     }
     tracksLoadedForSceneRef.current = sceneAtStart;
+    // Reset sound-history on a full (re)load so history resets per scene/reopen.
+    if (!incremental) soundHistory.reset();
 
     const isStale = (): boolean => tracksLoadedForSceneRef.current !== sceneAtStart;
 
@@ -293,6 +313,13 @@ export function DrumGeneratorPanel({
       }
       if (isStale()) return;
       setTracks(trackStates);
+      // Seed sound-history with each loaded sample so the first shuffle's
+      // "previous" sound (and the History tab) includes the on-load sound.
+      for (const ts of trackStates) {
+        if (ts.samplePath) {
+          soundHistory.record(ts.handle.id, ts.samplePath, sampleNameForDisplay(ts.samplePath));
+        }
+      }
     } catch (error: unknown) {
       console.error('[DrumGeneratorPanel] Failed to load tracks:', error);
     } finally {
@@ -300,7 +327,7 @@ export function DrumGeneratorPanel({
         setIsLoadingTracks(false);
       }
     }
-  }, [host, activeSceneId]);
+  }, [host, activeSceneId, soundHistory]);
 
   useEffect(() => {
     loadTracks();
@@ -526,6 +553,24 @@ export function DrumGeneratorPanel({
 
     onHeaderContent(
       <div className="flex gap-1">
+        {host.listImportableTracks && (
+          <button
+            data-testid="import-from-scene-drums-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              onExpandSelf?.();
+              setImportOpen(true);
+            }}
+            disabled={!activeSceneId}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+          >
+            From scene
+          </button>
+        )}
         <button
           data-testid="add-drum-track-button"
           onClick={(e: React.MouseEvent) => {
@@ -545,7 +590,8 @@ export function DrumGeneratorPanel({
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
-      needsContract, activeSceneId, tracks.length, handleAddTrack, onOpenContract]);
+      needsContract, activeSceneId, tracks.length, handleAddTrack, onOpenContract,
+      host, onExpandSelf]);
 
   useEffect(() => {
     if (!onLoading) return;
@@ -716,6 +762,11 @@ export function DrumGeneratorPanel({
           ? { ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath, hasMidi: true, generationProgress: 0, shuffleHistory: freshHistory }
           : t
       ));
+      // Generation is a fresh baseline — start sound-history over at this sample.
+      soundHistory.clear(trackId);
+      if (newSamplePath) {
+        soundHistory.record(trackId, newSamplePath, sampleNameForDisplay(newSamplePath));
+      }
       host.showToast('success', 'Drum pattern generated');
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Generation failed';
@@ -724,7 +775,7 @@ export function DrumGeneratorPanel({
       ));
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver]);
+  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver, soundHistory]);
 
   // --- Mute/Solo/Volume/Pan -----------------------------------------------
   const handleMuteToggle = useCallback((trackId: string): void => {
@@ -769,6 +820,15 @@ export function DrumGeneratorPanel({
     host.setTrackPan(trackId, pan).catch(() => {});
   }, [host]);
 
+  // Toggle the per-track ▾ drawer (History-only for drums — no instrument picker).
+  const handleToggleHistoryDrawer = useCallback((trackId: string): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId
+        ? { ...t, instrumentDrawerOpen: !t.instrumentDrawerOpen, fxDrawerOpen: false }
+        : t
+    ));
+  }, []);
+
   // --- Shuffle: cycle through every sample in the role before repeating ---
   // Each track maintains a per-track shuffleHistory Set of already-used
   // sample paths. We pass it to kitResolver.pick as the excludePaths; when
@@ -808,11 +868,13 @@ export function DrumGeneratorPanel({
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId ? { ...t, samplePath: picked, shuffleHistory: nextHistory } : t
       ));
+      // Record the new sound so the ↩ back-arrow + History tab can return to it.
+      soundHistory.record(trackId, picked, sampleNameForDisplay(picked));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host, tracks, activeSceneId, kitResolver]);
+  }, [host, tracks, activeSceneId, kitResolver, soundHistory]);
 
   // --- Duplicate track --------------------------------------------------
   const handleCopy = useCallback(async (trackId: string): Promise<void> => {
@@ -1000,8 +1062,21 @@ export function DrumGeneratorPanel({
   }
 
   if (!sceneContext?.hasContract) {
+    // Drums are neutral — importing a drum track from another scene does NOT
+    // require this scene to have a contract first. Mount the modal here too so
+    // the always-clickable "Import" header button stays reachable in the
+    // no-contract state (the common "import a drum into a brand-new scene" case).
     return (
       <div data-testid="no-contract-placeholder-drum" className="flex items-center justify-center py-8">
+        {host.listImportableTracks && (
+          <ImportTrackModal
+            host={host}
+            open={importOpen}
+            onClose={() => setImportOpen(false)}
+            onImported={() => { void loadTracks(true); }}
+            testIdPrefix="drums-import"
+          />
+        )}
         <button
           onClick={() => onOpenContract?.()}
           className="text-sas-muted text-xs hover:text-sas-accent transition-colors underline underline-offset-2"
@@ -1066,6 +1141,15 @@ export function DrumGeneratorPanel({
 
   return (
     <div data-testid="drum-section" className="p-2 space-y-2">
+      {host.listImportableTracks && (
+        <ImportTrackModal
+          host={host}
+          open={importOpen}
+          onClose={() => setImportOpen(false)}
+          onImported={() => { void loadTracks(true); }}
+          testIdPrefix="drums-import"
+        />
+      )}
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
@@ -1138,14 +1222,17 @@ export function DrumGeneratorPanel({
         onProgressChange={(pct: number) => handleProgressChange(track.handle.id, pct)}
         accentColor={DRUM_ACCENT_COLOR}
         instrumentName={track.instrumentName ?? (track.samplePath ? sampleNameForDisplay(track.samplePath) : null)}
-        // Drum tracks are pinned to the built-in sampler — the user can't pick a
-        // different instrument plugin. Omitting onToggleInstrumentDrawer (per the
-        // SDK's TrackRow contract) hides the "P" button entirely; the remaining
-        // instrument-drawer props (availableInstruments, currentInstrumentPluginId,
-        // instrumentDrawerOpen/Stage, onInstrumentSelect, onShowEditor, etc.)
-        // would be dead without that toggle, so they're dropped too. The
-        // instrumentName display above is kept — it still shows which sample
-        // is loaded as a passive label.
+        // Drum tracks are pinned to the built-in sampler — no instrument PICKER.
+        // The ▾ button opens a History-only drawer (no "Pick" tab, since
+        // onInstrumentSelect / availableInstruments are intentionally omitted).
+        onToggleInstrumentDrawer={() => handleToggleHistoryDrawer(track.handle.id)}
+        instrumentDrawerOpen={track.instrumentDrawerOpen}
+        // --- Sound history: ↩ back-arrow + the drawer's History tab ---
+        onUndoShuffle={() => { void soundHistory.undo(track.handle.id); }}
+        canUndoShuffle={soundHistory.canUndo(track.handle.id)}
+        soundHistory={soundHistory.list(track.handle.id).entries}
+        soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
+        onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
       />
     );
   }
