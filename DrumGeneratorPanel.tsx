@@ -102,6 +102,7 @@ export function DrumGeneratorPanel({
   const [tracks, setTracks] = useState<DrumTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [soundImportTarget, setSoundImportTarget] = useState<DrumTrackState | null>(null);
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
   const saveTimeoutRefs = useRef<Record<string, NodeJS.Timeout>>({});
@@ -140,6 +141,32 @@ export function DrumGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applyDrumSound, { onChange: persistSoundHistory });
+
+  // Import just the SAMPLE from a track in another scene (drawer "Import
+  // Sample"), bypassing the contract gate. The picker hands back the source
+  // track; we read its sound via host.getTrackSound, then apply + record it so
+  // it's undoable and persisted like a shuffle.
+  const handleSoundImportPick = useCallback(
+    async (sel: { sourceTrackDbId: string; trackName: string; sceneName: string }): Promise<void> => {
+      const target = soundImportTarget;
+      if (!target || !host.getTrackSound) { setSoundImportTarget(null); return; }
+      try {
+        const snap = await host.getTrackSound(sel.sourceTrackDbId);
+        if (!snap || snap.kind !== 'sample') {
+          host.showToast('error', 'No sample to import', `${sel.trackName} has no sample sound.`);
+          return;
+        }
+        await applyDrumSound(target.handle.id, snap.samplePath);
+        soundHistory.record(target.handle.id, snap.samplePath, snap.label);
+        host.showToast('success', 'Sample imported', `${snap.label} → ${target.handle.name}`);
+      } catch (err: unknown) {
+        host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
+      } finally {
+        setSoundImportTarget(null);
+      }
+    },
+    [soundImportTarget, host, applyDrumSound, soundHistory],
+  );
 
   // Pack-status drives the empty-state vs normal-state branch. Re-evaluated
   // on mount and after every download completes. While 'checking', the panel
@@ -586,7 +613,7 @@ export function DrumGeneratorPanel({
                 : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
             }`}
           >
-            From scene
+            Import Track
           </button>
         )}
         <button
@@ -602,7 +629,7 @@ export function DrumGeneratorPanel({
               : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
           }`}
         >
-          + Add
+          Add Track
         </button>
       </div>
     );
@@ -1168,6 +1195,18 @@ export function DrumGeneratorPanel({
           testIdPrefix="drums-import"
         />
       )}
+      {host.listImportableTracks && host.getTrackSound && (
+        <ImportTrackModal
+          host={host}
+          mode="sound"
+          open={!!soundImportTarget}
+          title="Import Sample"
+          onClose={() => setSoundImportTarget(null)}
+          onImported={() => {}}
+          onPick={handleSoundImportPick}
+          testIdPrefix="drums-sound-import"
+        />
+      )}
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
@@ -1250,6 +1289,8 @@ export function DrumGeneratorPanel({
         soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
         onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
         onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
+        onImportSound={() => setSoundImportTarget(track)}
+        importSoundLabel="Import Sample"
       />
     );
   }
