@@ -21,7 +21,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, useSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -130,7 +130,16 @@ export function DrumGeneratorPanel({
     },
     [host, activeSceneId],
   );
-  const soundHistory = useSoundHistory(applyDrumSound);
+  // Persist the per-track history to project scene-data so it survives reopen.
+  const persistSoundHistory = useCallback(
+    (trackId: string, state: TrackSoundHistory): void => {
+      if (!activeSceneId) return;
+      const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+      host.setSceneData(activeSceneId, `track:${dbId}:soundHistory`, state).catch(() => {});
+    },
+    [host, activeSceneId],
+  );
+  const soundHistory = useSoundHistory(applyDrumSound, { onChange: persistSoundHistory });
 
   // Pack-status drives the empty-state vs normal-state branch. Re-evaluated
   // on mount and after every download completes. While 'checking', the panel
@@ -195,6 +204,12 @@ export function DrumGeneratorPanel({
     if (!sceneAtStart) {
       setTracks([]);
       tracksLoadedForSceneRef.current = null;
+      // No scene → not loading. Without this, a load that already set
+      // isLoadingTracks=true and is then superseded by a flip to a null
+      // activeSceneId (the platform's effectiveSceneId briefly returns null
+      // while project.scenes repopulates during load) leaves the spinner
+      // stuck on "Loading tracks..." forever.
+      setIsLoadingTracks(false);
       return;
     }
 
@@ -313,10 +328,13 @@ export function DrumGeneratorPanel({
       }
       if (isStale()) return;
       setTracks(trackStates);
-      // Seed sound-history with each loaded sample so the first shuffle's
-      // "previous" sound (and the History tab) includes the on-load sound.
+      // Restore persisted history (survives reopen); else seed the loaded sample
+      // so the first shuffle's "previous" sound + the History tab have a baseline.
       for (const ts of trackStates) {
-        if (ts.samplePath) {
+        const persisted = sceneData[`track:${ts.handle.dbId}:soundHistory`];
+        if (persisted && typeof persisted === 'object') {
+          soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
+        } else if (ts.samplePath) {
           soundHistory.record(ts.handle.id, ts.samplePath, sampleNameForDisplay(ts.samplePath));
         }
       }
@@ -591,7 +609,7 @@ export function DrumGeneratorPanel({
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       needsContract, activeSceneId, tracks.length, handleAddTrack, onOpenContract,
-      host, onExpandSelf]);
+      host]);
 
   useEffect(() => {
     if (!onLoading) return;
@@ -1227,12 +1245,11 @@ export function DrumGeneratorPanel({
         // onInstrumentSelect / availableInstruments are intentionally omitted).
         onToggleInstrumentDrawer={() => handleToggleHistoryDrawer(track.handle.id)}
         instrumentDrawerOpen={track.instrumentDrawerOpen}
-        // --- Sound history: ↩ back-arrow + the drawer's History tab ---
-        onUndoShuffle={() => { void soundHistory.undo(track.handle.id); }}
-        canUndoShuffle={soundHistory.canUndo(track.handle.id)}
+        // --- Sound history: the drawer's History tab (restore + favorite) ---
         soundHistory={soundHistory.list(track.handle.id).entries}
         soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
         onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
+        onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
       />
     );
   }
