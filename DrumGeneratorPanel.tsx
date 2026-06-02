@@ -40,11 +40,16 @@ type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
 // getSamplePackInstalledVersion / startSamplePackDownload. The plugin only
 // declares its own packId + the copy shown on the download CTA, so it no
 // longer imports the app's shared/constants/sample-packs (W9 — no back doors).
+//
+// The description/sizeBytes below are a STATIC FALLBACK only — at runtime the
+// panel pulls the live copy from host.getSamplePackInfo (SDK 2.12+) so the CTA
+// matches whatever bundle the host actually ships. Kept current for hosts that
+// predate getSamplePackInfo.
 const DRUM_PACK: SamplePackCardInfo = {
   packId: 'sas-drum-pack',
   displayName: 'Drum Sample Library',
-  description: 'Kicks, snares, hats, percussion — needed to generate drum tracks',
-  sizeBytes: 100_934_888,
+  description: '24 roles — kicks, snares, hats, 808s, toms, cymbals, percussion & FX one-shots',
+  sizeBytes: 1_386_775_319,
 };
 
 const MAX_TRACKS = 16;
@@ -113,6 +118,9 @@ export function DrumGeneratorPanel({
   // on mount and after every download completes. While 'checking', the panel
   // shows a brief loading placeholder; thereafter it's either CTA or normal UI.
   const [packStatus, setPackStatus] = useState<PackStatus>('checking');
+  // Live CTA copy (size/description). Seeded with the static fallback, then
+  // overwritten by the host registry so it tracks the shipped bundle.
+  const [packInfo, setPackInfo] = useState<SamplePackCardInfo>(DRUM_PACK);
   const refreshPackStatus = useCallback(async (): Promise<void> => {
     const isCurrent = await host.isSamplePackCurrent(DRUM_PACK.packId).catch(() => false);
     if (isCurrent) {
@@ -127,6 +135,12 @@ export function DrumGeneratorPanel({
   }, [host, kitResolver]);
   useEffect(() => {
     void refreshPackStatus();
+    // Pull the canonical size/description from the host registry (SDK 2.12+);
+    // optional-chained so older hosts simply keep the static fallback.
+    void host.getSamplePackInfo?.(DRUM_PACK.packId)?.then(
+      (info) => { if (info) setPackInfo(info); },
+      () => {},
+    );
     const unsub = host.onSamplePackProgress(DRUM_PACK.packId, (p) => {
       if (p.status === 'complete') void refreshPackStatus();
     });
@@ -1043,7 +1057,7 @@ export function DrumGeneratorPanel({
     return (
       <SamplePackCTACard
         host={host}
-        pack={DRUM_PACK}
+        pack={packInfo}
         status={packStatus}
         onDownloadComplete={refreshPackStatus}
       />

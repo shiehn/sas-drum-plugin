@@ -18,6 +18,13 @@ export interface LLMDrumResponse {
   notes: PluginMidiNote[];
   role?: string;
   // subRole removed in Phase 0.8 — role is the folder name (flat taxonomy)
+  /**
+   * Optional short sonic descriptor (timbre/character) the LLM derives by
+   * translating the user's request into concrete sample-vocabulary words
+   * ("1950s" → "vintage warm analog tape"). Used to pick the closest-matching
+   * sample within the role; absent → caller falls back to the raw request.
+   */
+  sound?: string;
 }
 
 export function parseLLMDrumResponse(content: string): LLMDrumResponse | null {
@@ -67,8 +74,11 @@ export function parseLLMDrumResponse(content: string): LLMDrumResponse | null {
     // subRole removed in Phase 0.8 — if the LLM still emits one (drift while
     // the prompt change propagates), we ignore it; the role field now carries
     // the literal folder name.
+    const sound = typeof obj.sound === 'string' && obj.sound.trim().length > 0
+      ? obj.sound.trim()
+      : undefined;
 
-    return { notes: validNotes, role };
+    return { notes: validNotes, role, sound };
   } catch {
     return null;
   }

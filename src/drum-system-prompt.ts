@@ -33,7 +33,8 @@ Respond with ONLY a JSON object in this format:
   "notes": [
     { "pitch": 60, "startBeat": 0, "durationBeats": 0.25, "velocity": 110 }
   ],
-  "role": "kick"
+  "role": "kick",
+  "sound": "vintage warm analog tape dusty"
 }
 
 Rules:
@@ -42,6 +43,7 @@ Rules:
 - durationBeats: duration in quarter-note beats. Drum hits should be short — 0.1-0.25 is typical, longer for sustained cymbals.
 - velocity: 1-127. The sampler scales sample gain by velocity (≈ -20 dB at velocity 0, full at 127), so velocity directly controls how loud each hit sounds. Use velocity variation for groove: accent the downbeats (110-120), softer ghost notes (40-70), open hats louder than closed (90-110), and remember to vary slightly even on the "same" hit so the pattern doesn't sound machine-flat.
 - role: MUST be one of: ${rolesList}. This is the literal folder name under the drum library — the plugin uses it to pick which sample folder to draw from.
+- sound: a SHORT phrase (3-8 words) describing the desired TIMBRE / CHARACTER of the sample for this role. The plugin matches it against a library of per-sample text descriptions to pick the closest-sounding one. Translate era / genre / mood cues into concrete sonic words: "1950s" → "vintage warm analog tape", "trap" → "booming distorted 808 sub", "lo-fi" → "dusty saturated vinyl", "techno" → "punchy analog hard transient". Describe tone / material / era / character only — NOT rhythm or which drum it is. Omit the field only when the request implies no particular timbre.
 
 Style guidance:
 - Match the bar count and tempo from the musical context.

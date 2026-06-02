@@ -18,6 +18,7 @@
  * LLM's role vocabulary always matches what's actually on disk.
  */
 
+import { scorePromptMatch, pickTopKWeighted } from '@signalsandsorcery/plugin-sdk';
 import type { PluginHost } from '@signalsandsorcery/plugin-sdk';
 
 /**
@@ -36,19 +37,43 @@ import type { PluginHost } from '@signalsandsorcery/plugin-sdk';
  */
 export type SampleRootSource = string | (() => Promise<string | null>);
 
+/**
+ * Options for a query-aware pick. Passing a bare `ReadonlySet<string>` (the
+ * historical second argument) is still accepted and treated as `excludePaths`,
+ * so existing callers keep working unchanged.
+ */
+export interface PickOptions {
+  /** Shuffle history — paths to skip. */
+  excludePaths?: ReadonlySet<string>;
+  /**
+   * Free-text intent ("vintage dusty boom bap kick"). When supplied AND the
+   * role's samples have StableAudio prompt sidecars, the pick is biased
+   * toward the closest-matching sample (top-k weighted) instead of uniform
+   * random. With no query, no sidecars, or no token overlap, selection
+   * stays uniform random over the pool — identical to the historical
+   * behavior.
+   */
+  query?: string;
+}
+
+export interface KitResolverOptions {
+  /** Injectable RNG in [0, 1) for deterministic tests (default Math.random). */
+  rng?: () => number;
+}
+
 export interface KitResolver {
   /**
-   * Pick a random WAV path for the given role (= folder name), excluding
-   * any path in `excludePaths`. Returns `null` if the filtered pool is
-   * empty — caller treats null as a signal to reset its shuffle history
-   * and call again with an empty Set. Also returns null if the role
-   * is unknown.
+   * Pick a WAV path for the given role (= folder name).
    *
-   * `excludePaths` defaults to an empty Set, matching the natural "give
-   * me any random one" semantics. The panel's shuffle history is the
-   * typical input here.
+   * Second argument is either a `ReadonlySet<string>` of paths to exclude
+   * (the historical shape — shuffle history) or a {@link PickOptions} object
+   * that can additionally carry a `query` to bias the pick semantically.
+   *
+   * Returns `null` if the filtered pool is empty — caller treats null as a
+   * signal to reset its shuffle history and call again with an empty Set —
+   * or if the role is unknown.
    */
-  pick(role: string, excludePaths?: ReadonlySet<string>): Promise<string | null>;
+  pick(role: string, options?: ReadonlySet<string> | PickOptions): Promise<string | null>;
 
   /**
    * The list of role names (= folder names) discovered under the library
@@ -63,10 +88,44 @@ export interface KitResolver {
   reset(): void;
 }
 
-export function createKitResolver(host: PluginHost, root: SampleRootSource): KitResolver {
+export function createKitResolver(
+  host: PluginHost,
+  root: SampleRootSource,
+  options?: KitResolverOptions,
+): KitResolver {
+  const rng = options?.rng ?? Math.random;
+
   /** Lazily-populated map: folder name → list of absolute WAV paths. */
   let cache: Map<string, string[]> | null = null;
   let listingPromise: Promise<Map<string, string[]>> | null = null;
+
+  /**
+   * Lazily-populated map: WAV path → its StableAudio prompt (the sibling
+   * `<name>.txt` sidecar, trimmed; '' when missing/unreadable). Filled per
+   * role on the first query-aware pick for that role, then cached for the
+   * resolver lifetime. Roles that are only ever picked randomly never pay
+   * the sidecar-read cost.
+   */
+  const promptCache = new Map<string, string>();
+  const promptsLoadedRoles = new Set<string>();
+
+  /** Read every sidecar for a role's pool once, in parallel. */
+  async function ensurePromptsForRole(role: string, pool: readonly string[]): Promise<void> {
+    if (promptsLoadedRoles.has(role)) return;
+    await Promise.all(
+      pool.map(async (wavPath) => {
+        if (promptCache.has(wavPath)) return;
+        const sidecar = wavPath.replace(/\.wav$/iu, '.txt');
+        try {
+          const text = await host.readTextFile(sidecar);
+          promptCache.set(wavPath, text ? text.trim() : '');
+        } catch {
+          promptCache.set(wavPath, '');
+        }
+      }),
+    );
+    promptsLoadedRoles.add(role);
+  }
 
   async function resolveRoot(): Promise<string | null> {
     if (typeof root === 'string') return root;
@@ -110,8 +169,17 @@ export function createKitResolver(host: PluginHost, root: SampleRootSource): Kit
     return listingPromise;
   }
 
-  async function pick(role: string, excludePaths?: ReadonlySet<string>): Promise<string | null> {
+  async function pick(
+    role: string,
+    options?: ReadonlySet<string> | PickOptions,
+  ): Promise<string | null> {
     if (!role) return null;
+
+    // Historical second arg was a bare Set (excludePaths); accept both shapes.
+    const { excludePaths, query } =
+      options instanceof Set
+        ? { excludePaths: options as ReadonlySet<string>, query: undefined }
+        : ((options as PickOptions) ?? {});
 
     let byFolder: Map<string, string[]>;
     try {
@@ -128,7 +196,30 @@ export function createKitResolver(host: PluginHost, root: SampleRootSource): Kit
       ? pool.filter(p => !excludePaths.has(p))
       : pool;
     if (filtered.length === 0) return null;
-    const idx = Math.floor(Math.random() * filtered.length);
+
+    // Semantic pick: bias toward the sample whose prompt best matches the
+    // query. Any failure (no sidecars, no token overlap, read error) falls
+    // through to the uniform-random pick below — never a hard failure.
+    const trimmedQuery = query?.trim();
+    if (trimmedQuery) {
+      try {
+        await ensurePromptsForRole(role, pool);
+        const prompts = filtered.map((p) => promptCache.get(p) ?? '');
+        const scores = scorePromptMatch(trimmedQuery, prompts);
+        const maxScore = scores.reduce((m, s) => Math.max(m, s), 0);
+        if (maxScore > 0) {
+          const picked = pickTopKWeighted(
+            filtered.map((p, i) => ({ item: p, score: scores[i], key: p })),
+            { rng },
+          );
+          if (picked) return picked;
+        }
+      } catch (err) {
+        console.warn('[kit-resolver] Semantic pick failed, using random:', err);
+      }
+    }
+
+    const idx = Math.floor(rng() * filtered.length);
     return filtered[idx] ?? null;
   }
 
@@ -155,6 +246,8 @@ export function createKitResolver(host: PluginHost, root: SampleRootSource): Kit
     reset(): void {
       cache = null;
       listingPromise = null;
+      promptCache.clear();
+      promptsLoadedRoles.clear();
     },
   };
 }

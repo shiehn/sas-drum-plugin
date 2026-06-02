@@ -8,7 +8,7 @@
  * takes the live role list as a parameter.
  *
  * Host-side `setTrackDrumKit` + `listAudioFiles` integration is covered
- * in `sas-assistant/src/main/services/__tests__/plugin-host-drum-kit.test.ts`.
+ * in `sas-app/src/main/services/__tests__/plugin-host-drum-kit.test.ts`.
  */
 
 import { describe, it, expect, jest } from '@jest/globals';
