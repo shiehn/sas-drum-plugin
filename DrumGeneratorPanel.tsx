@@ -21,7 +21,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -75,7 +75,10 @@ interface DrumTrackState {
   shuffleHistory: Set<string>;
   runtimeState: PluginTrackRuntimeState;
   fxDetailState: TrackFxDetailState;
-  fxDrawerOpen: boolean;
+  // Unified drawer state (replaces fxDrawerOpen + instrumentDrawerOpen + instrumentDrawerStage).
+  drawerOpen: boolean;
+  drawerTab: DrawerTab;
+  editorStage: boolean;
   isGenerating: boolean;
   error: string | null;
   hasMidi: boolean;
@@ -83,8 +86,6 @@ interface DrumTrackState {
   instrumentPluginId: string | null;
   instrumentName: string | null;
   instrumentMissing: boolean;
-  instrumentDrawerOpen: boolean;
-  instrumentDrawerStage: 'instruments' | 'editor';
 }
 
 export function DrumGeneratorPanel({
@@ -341,7 +342,9 @@ export function DrumGeneratorPanel({
           shuffleHistory: samplePath ? new Set<string>([samplePath]) : new Set<string>(),
           runtimeState,
           fxDetailState,
-          fxDrawerOpen: false,
+          drawerOpen: false,
+          drawerTab: 'fx',
+          editorStage: false,
           isGenerating: false,
           error: null,
           hasMidi,
@@ -349,8 +352,6 @@ export function DrumGeneratorPanel({
           instrumentPluginId: handle.instrumentPluginId ?? null,
           instrumentName: handle.instrumentName ?? null,
           instrumentMissing,
-          instrumentDrawerOpen: false,
-          instrumentDrawerStage: 'instruments',
         });
       }
       if (isStale()) return;
@@ -511,7 +512,9 @@ export function DrumGeneratorPanel({
         shuffleHistory: new Set<string>(),
         runtimeState: { id: handle.id, muted: false, solo: false, volume: 0.75, pan: 0 },
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
-        fxDrawerOpen: false,
+        drawerOpen: false,
+        drawerTab: 'fx',
+        editorStage: false,
         isGenerating: false,
         error: null,
         hasMidi: false,
@@ -519,8 +522,6 @@ export function DrumGeneratorPanel({
         instrumentPluginId: null,
         instrumentName: null,
         instrumentMissing: false,
-        instrumentDrawerOpen: false,
-        instrumentDrawerStage: 'instruments',
       };
       setTracks(prev => [...prev, newTrack]);
       onExpandSelf?.();
@@ -865,13 +866,14 @@ export function DrumGeneratorPanel({
     host.setTrackPan(trackId, pan).catch(() => {});
   }, [host]);
 
-  // Toggle the per-track ▾ drawer (History-only for drums — no instrument picker).
-  const handleToggleHistoryDrawer = useCallback((trackId: string): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, instrumentDrawerOpen: !t.instrumentDrawerOpen, fxDrawerOpen: false }
-        : t
-    ));
+  // The ▾ button opens the unified drawer to a non-FX tab (History for drums),
+  // or closes it if it's already showing one.
+  const handleToggleDrawer = useCallback((trackId: string): void => {
+    setTracks(prev => prev.map(t => {
+      if (t.handle.id !== trackId) return t;
+      const onSound = t.drawerOpen && t.drawerTab !== 'fx';
+      return { ...t, drawerOpen: !onSound, drawerTab: 'history', editorStage: false };
+    }));
   }, []);
 
   // --- Shuffle: cycle through every sample in the role before repeating ---
@@ -976,11 +978,15 @@ export function DrumGeneratorPanel({
   }, [host]);
 
   const toggleFxDrawer = useCallback((trackId: string): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen, instrumentDrawerOpen: false, instrumentDrawerStage: 'instruments' as const } : t
-    ));
+    setTracks(prev => prev.map(t => {
+      if (t.handle.id !== trackId) return t;
+      const onFx = t.drawerOpen && t.drawerTab === 'fx';
+      return { ...t, drawerOpen: !onFx, drawerTab: 'fx', editorStage: false };
+    }));
     const track = tracks.find(t => t.handle.id === trackId);
-    if (track && !track.fxDrawerOpen) {
+    // Refresh FX state from the engine whenever we OPEN the FX tab.
+    const wasOnFx = !!track && track.drawerOpen && track.drawerTab === 'fx';
+    if (track && !wasOnFx) {
       host.getTrackFxState(trackId).then(fxState => {
         setTracks(prev => prev.map(t =>
           t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
@@ -988,6 +994,20 @@ export function DrumGeneratorPanel({
       }).catch(() => {});
     }
   }, [host, tracks]);
+
+  // Tab-strip clicks: switch the active tab, keeping the drawer open.
+  const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId ? { ...t, drawerOpen: true, drawerTab: tab } : t
+    ));
+    if (tab === 'fx') {
+      host.getTrackFxState(trackId).then(fxState => {
+        setTracks(prev => prev.map(t =>
+          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
+        ));
+      }).catch(() => {});
+    }
+  }, [host]);
 
   const handleProgressChange = useCallback((trackId: string, pct: number): void => {
     setTracks(prev => prev.map(t =>
@@ -999,9 +1019,8 @@ export function DrumGeneratorPanel({
   const toggleInstrumentDrawer = useCallback((trackId: string): void => {
     setTracks(prev => prev.map((t: DrumTrackState) => {
       if (t.handle.id !== trackId) return t;
-      const opening = !t.instrumentDrawerOpen;
-      const stage = opening && t.instrumentPluginId ? 'editor' as const : 'instruments' as const;
-      return { ...t, instrumentDrawerOpen: opening, fxDrawerOpen: false, instrumentDrawerStage: stage };
+      const onPick = t.drawerOpen && t.drawerTab === 'pick';
+      return { ...t, drawerOpen: !onPick, drawerTab: 'pick', editorStage: !onPick && !!t.instrumentPluginId };
     }));
     if (availableInstruments.length === 0 && !instrumentsLoading) {
       setInstrumentsLoading(true);
@@ -1018,7 +1037,7 @@ export function DrumGeneratorPanel({
 
     if (isSurgeXt) {
       setTracks(prev => prev.map((t: DrumTrackState) =>
-        t.handle.id === trackId ? { ...t, instrumentDrawerOpen: false, instrumentDrawerStage: 'instruments' as const } : t
+        t.handle.id === trackId ? { ...t, drawerOpen: false, editorStage: false } : t
       ));
       try {
         await host.setTrackInstrument(trackId, pluginId);
@@ -1041,7 +1060,7 @@ export function DrumGeneratorPanel({
     }
 
     setTracks(prev => prev.map((t: DrumTrackState) =>
-      t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'editor' as const } : t
+      t.handle.id === trackId ? { ...t, drawerTab: 'pick', editorStage: true } : t
     ));
 
     try {
@@ -1062,7 +1081,7 @@ export function DrumGeneratorPanel({
       console.error('[DrumGeneratorPanel] Failed to set instrument:', err);
       host.showToast('error', 'Instrument load failed', msg);
       setTracks(prev => prev.map((t: DrumTrackState) =>
-        t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'instruments' as const } : t
+        t.handle.id === trackId ? { ...t, editorStage: false } : t
       ));
     }
   }, [host]);
@@ -1078,7 +1097,7 @@ export function DrumGeneratorPanel({
 
   const handleBackToInstruments = useCallback((trackId: string): void => {
     setTracks(prev => prev.map((t: DrumTrackState) =>
-      t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'instruments' as const } : t
+      t.handle.id === trackId ? { ...t, editorStage: false } : t
     ));
   }, []);
 
@@ -1256,7 +1275,9 @@ export function DrumGeneratorPanel({
           pan: track.runtimeState.pan,
         }}
         fxDetailState={track.fxDetailState}
-        fxDrawerOpen={track.fxDrawerOpen}
+        drawerOpen={track.drawerOpen}
+        drawerTab={track.drawerTab}
+        onTabChange={(tab) => handleTabChange(track.handle.id, tab)}
         isGenerating={track.isGenerating}
         isAuthenticated={isAuthenticated}
         error={track.error}
@@ -1280,10 +1301,9 @@ export function DrumGeneratorPanel({
         accentColor={DRUM_ACCENT_COLOR}
         instrumentName={track.instrumentName ?? (track.samplePath ? sampleNameForDisplay(track.samplePath) : null)}
         // Drum tracks are pinned to the built-in sampler — no instrument PICKER.
-        // The ▾ button opens a History-only drawer (no "Pick" tab, since
+        // The ▾ button opens the drawer to History (no "Pick" tab, since
         // onInstrumentSelect / availableInstruments are intentionally omitted).
-        onToggleInstrumentDrawer={() => handleToggleHistoryDrawer(track.handle.id)}
-        instrumentDrawerOpen={track.instrumentDrawerOpen}
+        onToggleDrawer={() => handleToggleDrawer(track.handle.id)}
         // --- Sound history: the drawer's History tab (restore + favorite) ---
         soundHistory={soundHistory.list(track.handle.id).entries}
         soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
