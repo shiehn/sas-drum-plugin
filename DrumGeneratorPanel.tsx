@@ -16,12 +16,13 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
   MidiClipData,
+  PluginMidiNote,
   BulkAddPlaceholderTrack,
   InstrumentDescriptor,
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -83,6 +84,14 @@ interface DrumTrackState {
   error: string | null;
   hasMidi: boolean;
   generationProgress: number;
+  // Piano-roll edit state. `editNotes` is the live, editable copy of the
+  // track's MIDI (loaded lazily when the Edit tab is first opened, or seeded
+  // from a fresh generation). `editBars`/`editBpm` size the grid + the save
+  // span. Drum MIDI is flattened to pitch 60, so the roll's pitch axis is
+  // cosmetic here. See loadEditNotes / handleNotesChange.
+  editNotes: PluginMidiNote[];
+  editBars: number;
+  editBpm: number;
   instrumentPluginId: string | null;
   instrumentName: string | null;
   instrumentMissing: boolean;
@@ -107,6 +116,10 @@ export function DrumGeneratorPanel({
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
   const saveTimeoutRefs = useRef<Record<string, NodeJS.Timeout>>({});
+  // Tracks whose Edit-tab MIDI has been fetched (or seeded by a generation),
+  // so re-opening the tab doesn't re-fetch and clobber unsaved edits. A ref,
+  // not state — toggling it must never trigger a re-render.
+  const editLoadStartedRef = useRef<Set<string>>(new Set());
   const [availableInstruments, setAvailableInstruments] = useState<InstrumentDescriptor[]>([]);
   const [instrumentsLoading, setInstrumentsLoading] = useState(false);
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
@@ -142,6 +155,14 @@ export function DrumGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applyDrumSound, { onChange: persistSoundHistory });
+
+  // Drag-to-reorder rows (shared SDK hook; persists per-scene by stable dbId).
+  const reorder = useTrackReorder<DrumTrackState>({
+    host,
+    items: tracks,
+    setItems: setTracks,
+    getId: (t) => t.handle.dbId,
+  });
 
   // Import just the SAMPLE from a track in another scene (drawer "Import
   // Sample"), bypassing the contract gate. The picker hands back the source
@@ -349,6 +370,9 @@ export function DrumGeneratorPanel({
           error: null,
           hasMidi,
           generationProgress: 0,
+          editNotes: [],
+          editBars: 4,
+          editBpm: 120,
           instrumentPluginId: handle.instrumentPluginId ?? null,
           instrumentName: handle.instrumentName ?? null,
           instrumentMissing,
@@ -519,6 +543,9 @@ export function DrumGeneratorPanel({
         error: null,
         hasMidi: false,
         generationProgress: 0,
+        editNotes: [],
+        editBars: 4,
+        editBpm: 120,
         instrumentPluginId: null,
         instrumentName: null,
         instrumentMissing: false,
@@ -805,9 +832,17 @@ export function DrumGeneratorPanel({
 
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId
-          ? { ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath, hasMidi: true, generationProgress: 0, shuffleHistory: freshHistory }
+          ? {
+              ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath,
+              hasMidi: true, generationProgress: 0, shuffleHistory: freshHistory,
+              // Seed the piano-roll's editable copy from the just-generated notes
+              // (flattened to pitch 60 like all drum MIDI). The Edit tab opens with
+              // no round-trip and won't clobber these.
+              editNotes: processedNotes, editBars: musicalContext.bars, editBpm: musicalContext.bpm,
+            }
           : t
       ));
+      editLoadStartedRef.current.add(trackId);
       // Generation is a fresh baseline — start sound-history over at this sample.
       soundHistory.clear(trackId);
       if (newSamplePath) {
@@ -995,6 +1030,61 @@ export function DrumGeneratorPanel({
     }
   }, [host, tracks]);
 
+  // --- Piano-roll edit (load on first open, debounced save) ---
+  // Lazily fetch the track's current MIDI the first time the Edit tab opens.
+  // Reads LIVE engine state via host.readMidiNotes (optional method — older
+  // hosts simply get an empty editor). bars/bpm come from the musical context
+  // so the grid + save span match the scene.
+  const loadEditNotes = useCallback(async (trackId: string): Promise<void> => {
+    try {
+      const mc = await host.getMusicalContext();
+      let notes: PluginMidiNote[] = [];
+      if (typeof host.readMidiNotes === 'function') {
+        const result = await host.readMidiNotes(trackId);
+        notes = result.clips[0]?.notes ?? [];
+      }
+      setTracks(prev => prev.map(t =>
+        t.handle.id === trackId
+          ? { ...t, editNotes: notes, editBars: mc.bars, editBpm: mc.bpm }
+          : t
+      ));
+    } catch (err: unknown) {
+      console.warn('[DrumGeneratorPanel] Failed to load MIDI for editing:', err);
+    }
+  }, [host]);
+
+  // Every piano-roll edit: optimistic state update + debounced persist. Reads
+  // bars/bpm inside the timeout (not from track state) so the callback stays
+  // stable on [host] and we never write a stale span. Empty clip → clearMidi
+  // (writeMidiClip throws INVALID_MIDI on zero notes).
+  const handleNotesChange = useCallback((trackId: string, notes: PluginMidiNote[]): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId ? { ...t, editNotes: notes } : t
+    ));
+    const key = `edit:${trackId}`;
+    if (saveTimeoutRefs.current[key]) clearTimeout(saveTimeoutRefs.current[key]);
+    saveTimeoutRefs.current[key] = setTimeout(() => {
+      void (async (): Promise<void> => {
+        try {
+          if (notes.length === 0) {
+            await host.clearMidi(trackId);
+          } else {
+            const mc = await host.getMusicalContext();
+            await host.writeMidiClip(trackId, {
+              startTime: 0,
+              endTime: (mc.bars * 4 * 60) / mc.bpm,
+              tempo: mc.bpm,
+              notes,
+            });
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          host.showToast('error', 'Failed to save edit', msg);
+        }
+      })();
+    }, 300);
+  }, [host]);
+
   // Tab-strip clicks: switch the active tab, keeping the drawer open.
   const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {
     setTracks(prev => prev.map(t =>
@@ -1006,8 +1096,11 @@ export function DrumGeneratorPanel({
           t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
         ));
       }).catch(() => {});
+    } else if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
+      editLoadStartedRef.current.add(trackId);
+      void loadEditNotes(trackId);
     }
-  }, [host]);
+  }, [host, loadEditNotes]);
 
   const handleProgressChange = useCallback((trackId: string, pct: number): void => {
     setTracks(prev => prev.map(t =>
@@ -1229,7 +1322,7 @@ export function DrumGeneratorPanel({
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
-        tracks.map((track: DrumTrackState) => renderTrackRow(track))
+        tracks.map((track: DrumTrackState, index: number) => renderTrackRow(track, reorder.dragPropsFor(index)))
       )}
 
       {!isLoadingTracks && tracks.length > 0 && (() => {
@@ -1262,10 +1355,11 @@ export function DrumGeneratorPanel({
     </div>
   );
 
-  function renderTrackRow(track: DrumTrackState): React.ReactElement {
+  function renderTrackRow(track: DrumTrackState, drag?: TrackRowDragProps): React.ReactElement {
     return (
       <TrackRow
         key={track.handle.id}
+        drag={drag}
         track={{ id: track.handle.id, name: track.handle.name, role: track.role }}
         prompt={track.prompt}
         runtimeState={{
@@ -1311,6 +1405,12 @@ export function DrumGeneratorPanel({
         onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
         onImportSound={() => setSoundImportTarget(track)}
         importSoundLabel="Import Sample"
+        editNotes={track.editNotes}
+        onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
+        editBars={track.editBars}
+        editBpm={track.editBpm}
+        editSnap={0.25}
+        onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
       />
     );
   }
