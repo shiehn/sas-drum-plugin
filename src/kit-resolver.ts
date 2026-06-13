@@ -22,20 +22,28 @@ import { scorePromptMatch, pickTopKWeighted } from '@signalsandsorcery/plugin-sd
 import type { PluginHost } from '@signalsandsorcery/plugin-sdk';
 
 /**
- * Source of the library root for createKitResolver.
+ * Source of the library root(s) for createKitResolver.
  *
- *   - string                                 — used directly
- *   - () => Promise<string | null>           — resolved lazily on first scan;
- *                                              null means "no library installed"
- *                                              (resolver returns empty/null
- *                                              cleanly, panel should show CTA)
+ *   - string                                 — single root, used directly
+ *   - string[]                               — multiple roots, scanned in order
+ *   - () => Promise<string | string[] | null> — resolved lazily on first scan;
+ *                                              null / [] means "no library
+ *                                              installed" (resolver returns
+ *                                              empty/null cleanly, panel
+ *                                              should show CTA)
  *
- * The drum panel passes a function that calls `host.getSamplePackRoot('sas-drum-pack')`,
- * which returns null when the sample pack isn't installed or is at a stale
- * version. The panel guards its UI with `host.isSamplePackCurrent(...)` so
- * the resolver is normally only consulted when the pack IS current.
+ * The drum panel passes a function combining `host.getSamplePackRoot('sas-drum-pack')`
+ * (the distributed pack — null when not installed or stale) with
+ * `host.getUserSampleRoots?.('drums')` (one root per user-imported pack).
+ * Distributed root first, user roots after; samples from every root merge
+ * into one role pool, so generate/shuffle draw from the union. Roots are
+ * independent: a missing/unreadable root is skipped with a warning rather
+ * than failing the whole scan.
  */
-export type SampleRootSource = string | (() => Promise<string | null>);
+export type SampleRootSource =
+  | string
+  | string[]
+  | (() => Promise<string | string[] | null>);
 
 /**
  * Options for a query-aware pick. Passing a bare `ReadonlySet<string>` (the
@@ -127,10 +135,24 @@ export function createKitResolver(
     promptsLoadedRoles.add(role);
   }
 
-  async function resolveRoot(): Promise<string | null> {
-    if (typeof root === 'string') return root;
-    const resolved = await root();
-    return resolved && resolved.length > 0 ? resolved : null;
+  /**
+   * Normalize whatever the root source yields into an ordered, de-duplicated
+   * list of root paths. Distributed root(s) first, user roots after (the
+   * panel builds the array in that order). Empty when nothing is installed.
+   */
+  async function resolveRoots(): Promise<string[]> {
+    const raw = typeof root === 'function' ? await root() : root;
+    if (!raw) return [];
+    const list = Array.isArray(raw) ? raw : [raw];
+    const seen = new Set<string>();
+    const roots: string[] = [];
+    for (const r of list) {
+      if (typeof r === 'string' && r.length > 0 && !seen.has(r)) {
+        seen.add(r);
+        roots.push(r);
+      }
+    }
+    return roots;
   }
 
   async function getCache(): Promise<Map<string, string[]>> {
@@ -139,22 +161,37 @@ export function createKitResolver(
 
     listingPromise = (async () => {
       try {
-        const rootPath = await resolveRoot();
-        if (!rootPath) {
+        const roots = await resolveRoots();
+        if (roots.length === 0) {
           cache = new Map();
           return cache;
         }
-        const paths = await host.listAudioFiles(rootPath, { extensions: ['.wav'], recursive: true });
         const byFolder = new Map<string, string[]>();
-        for (const p of paths) {
-          // The folder we care about is the immediate parent dir name —
-          // e.g. ".../processed/kick/kick-12345.wav" → "kick".
-          const parts = p.split('/');
-          const folder = parts[parts.length - 2] ?? '';
-          if (!folder) continue;
-          const list = byFolder.get(folder) ?? [];
-          list.push(p);
-          byFolder.set(folder, list);
+        // Scan every root independently and merge into one role→paths map, so
+        // a role pool can draw from the distributed pack AND user packs at
+        // once. One root failing (missing dir, disk hiccup) is skipped — the
+        // others still populate.
+        for (const rootPath of roots) {
+          let paths: string[];
+          try {
+            paths = await host.listAudioFiles(rootPath, { extensions: ['.wav'], recursive: true });
+          } catch (err: unknown) {
+            console.warn(`[kit-resolver] Failed to list samples under ${rootPath}:`, err);
+            continue;
+          }
+          for (const p of paths) {
+            // The folder we care about is the immediate parent dir name —
+            // e.g. ".../processed/kick/kick-12345.wav" → "kick".
+            const parts = p.split('/');
+            const folder = parts[parts.length - 2] ?? '';
+            if (!folder) continue;
+            const existing = byFolder.get(folder);
+            if (existing) {
+              existing.push(p);
+            } else {
+              byFolder.set(folder, [p]);
+            }
+          }
         }
         cache = byFolder;
         return byFolder;

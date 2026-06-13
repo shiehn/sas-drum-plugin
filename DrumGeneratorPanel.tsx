@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -126,8 +126,20 @@ export function DrumGeneratorPanel({
   // Phase 1.1 (sample pack distribution): the resolver is fed the live
   // sample-pack root. When the pack is missing or stale, getSamplePackRoot
   // returns null and we render the CTA card instead of the normal panel.
+  //
+  // Local-samples spike: the resolver scans the distributed pack root AND
+  // every user-imported drum pack root (`<userData>/user-samples/drums/*`),
+  // merging their role pools so generate/shuffle draw from the union.
+  // Distributed first, user roots after. getUserSampleRoots is optional
+  // (older host) → feature-checked, absence treated as no user packs.
   const [kitResolver] = useState(() =>
-    createKitResolver(host, () => host.getSamplePackRoot(DRUM_PACK.packId)),
+    createKitResolver(host, async () => {
+      const distributed = await host.getSamplePackRoot(DRUM_PACK.packId).catch(() => null);
+      const userRoots = (await host.getUserSampleRoots?.('drums')?.catch(() => [])) ?? [];
+      return [distributed, ...userRoots].filter(
+        (r): r is string => typeof r === 'string' && r.length > 0,
+      );
+    }),
   );
 
   // --- Sound history (↩ back-arrow + drawer "History" tab) --------------
@@ -155,6 +167,8 @@ export function DrumGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applyDrumSound, { onChange: persistSoundHistory });
+  // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
+  const anySolo = useAnySolo(host);
 
   // Drag-to-reorder rows (shared SDK hook; persists per-scene by stable dbId).
   const reorder = useTrackReorder<DrumTrackState>({
@@ -566,6 +580,52 @@ export function DrumGeneratorPanel({
       setIsAddingTrack(false);
     }
   }, [host, activeSceneId, isConnected, isAuthenticated, tracks.length, onExpandSelf]);
+
+  // Cross-panel import ("re-sound a part on drums"): pull a MIDI part out of a
+  // track owned by ANOTHER panel in THIS scene and trigger it through a drum
+  // kit. The discovery gate disables melodic→drum (a melodic part has no kit),
+  // so in practice this only fires for percussive sources; it's implemented for
+  // symmetry. createTrack registers ownership synchronously, so the owned
+  // writes below are safe.
+  const handlePortTrack = useCallback(
+    async (sel: { sourceTrackDbId: string; trackName: string; role?: string }): Promise<void> => {
+      if (!activeSceneId) { host.showToast('warning', 'Select SCENE'); return; }
+      if (!isConnected) { host.showToast('warning', 'Systems not connected'); return; }
+      if (tracks.length >= MAX_TRACKS) { host.showToast('warning', 'Track limit reached'); return; }
+      if (!host.readImportableTrackMidi) return;
+      let handle: PluginTrackHandle | null = null;
+      try {
+        handle = await host.createTrack({ name: `drum-${Date.now()}` });
+        const midi = await host.readImportableTrackMidi(sel.sourceTrackDbId);
+        const notes = midi.clips[0]?.notes ?? [];
+        if (notes.length > 0) {
+          const mc = await host.getMusicalContext();
+          await host.writeMidiClip(handle.id, {
+            startTime: 0,
+            endTime: (mc.bars * 4 * 60) / mc.bpm,
+            tempo: mc.bpm,
+            notes,
+          });
+        }
+        // Role-matched kit via the same resolver the generate/shuffle paths use.
+        const role = sel.role ?? '';
+        if (role) {
+          try { await host.setTrackRole(handle.id, role); } catch { /* non-fatal */ }
+          const picked = await kitResolver.pick(role);
+          if (picked) {
+            await applyDrumSound(handle.id, picked);
+            soundHistory.record(handle.id, picked, sampleNameForDisplay(picked));
+          }
+        }
+        host.showToast('success', 'Imported to drums', notes.length ? `${sel.trackName} → drums` : `${sel.trackName} (no MIDI yet)`);
+        await loadTracks(true);
+      } catch (err: unknown) {
+        if (handle) { try { await host.deleteTrack(handle.id); } catch { /* best effort */ } }
+        host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
+      }
+    },
+    [host, activeSceneId, isConnected, tracks.length, kitResolver, applyDrumSound, soundHistory, loadTracks],
+  );
 
   // Compose flow intentionally omitted — see the header-content comment
   // below. Reinstate this callback once `host.composeScene` is plugin-aware
@@ -1231,6 +1291,7 @@ export function DrumGeneratorPanel({
             open={importOpen}
             onClose={() => setImportOpen(false)}
             onImported={() => { void loadTracks(true); }}
+            onPortTrack={host.readImportableTrackMidi ? handlePortTrack : undefined}
             testIdPrefix="drums-import"
           />
         )}
@@ -1304,6 +1365,7 @@ export function DrumGeneratorPanel({
           open={importOpen}
           onClose={() => setImportOpen(false)}
           onImported={() => { void loadTracks(true); }}
+          onPortTrack={host.readImportableTrackMidi ? handlePortTrack : undefined}
           testIdPrefix="drums-import"
         />
       )}
@@ -1368,6 +1430,7 @@ export function DrumGeneratorPanel({
           volume: track.runtimeState.volume,
           pan: track.runtimeState.pan,
         }}
+        soloedOut={anySolo && !track.runtimeState.solo}
         fxDetailState={track.fxDetailState}
         drawerOpen={track.drawerOpen}
         drawerTab={track.drawerTab}
