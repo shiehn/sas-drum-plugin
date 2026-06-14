@@ -208,6 +208,11 @@ export function DrumGeneratorPanel({
   // on mount and after every download completes. While 'checking', the panel
   // shows a brief loading placeholder; thereafter it's either CTA or normal UI.
   const [packStatus, setPackStatus] = useState<PackStatus>('checking');
+  // Local-samples: number of user-imported drum packs. When > 0 the panel is
+  // fully usable even if the stock pack is missing/stale — the resolver scans
+  // the user roots too. Loaded on mount + refreshed on every `user:drums`
+  // library broadcast.
+  const [userPackCount, setUserPackCount] = useState(0);
   // Live CTA copy (size/description). Seeded with the static fallback, then
   // overwritten by the host registry so it tracks the shipped bundle.
   const [packInfo, setPackInfo] = useState<SamplePackCardInfo>(DRUM_PACK);
@@ -237,6 +242,23 @@ export function DrumGeneratorPanel({
     return unsub;
   }, [refreshPackStatus, host]);
 
+  // Local-samples: track the user-imported drum pack count and re-arm the
+  // resolver whenever the user library changes. The import wizard broadcasts on
+  // the same `pack:progress` channel with packId `user:drums`, so we subscribe
+  // exactly like the stock-pack progress above.
+  const refreshUserPacks = useCallback(async (): Promise<void> => {
+    const roots = (await host.getUserSampleRoots?.('drums')?.catch(() => [])) ?? [];
+    setUserPackCount(roots.length);
+    kitResolver.reset();
+  }, [host, kitResolver]);
+  useEffect(() => {
+    void refreshUserPacks();
+    const unsub = host.onSamplePackProgress('user:drums', (p) => {
+      if (p.status === 'complete') void refreshUserPacks();
+    });
+    return unsub;
+  }, [refreshUserPacks, host]);
+
   // Phase 0.8: live drum-role vocabulary discovered from the library FS.
   // Populated by an effect on mount + when the resolver gets reset; fed
   // into buildDrumSystemPrompt(...) so the LLM is constrained to actual
@@ -244,7 +266,9 @@ export function DrumGeneratorPanel({
   // when packStatus flips to 'current' (e.g., right after a download).
   const [availableRoles, setAvailableRoles] = useState<string[]>([]);
   useEffect(() => {
-    if (packStatus !== 'current') {
+    // Discover roles whenever ANY library is available — the stock pack OR at
+    // least one user-imported pack (the resolver merges both root sets).
+    if (packStatus !== 'current' && userPackCount === 0) {
       setAvailableRoles([]);
       return;
     }
@@ -258,7 +282,7 @@ export function DrumGeneratorPanel({
       }
     })();
     return () => { cancelled = true; };
-  }, [kitResolver, packStatus]);
+  }, [kitResolver, packStatus, userPackCount]);
 
   // --- Load tracks when scene changes -----------------------------------
   const tracksLoadedForSceneRef = useRef<string | null>(null);
@@ -670,10 +694,10 @@ export function DrumGeneratorPanel({
   const needsContract = !sceneContext?.hasContract;
   useEffect(() => {
     if (!onHeaderContent) return;
-    // Hide the "+ Add" button until the sample pack is installed — the
-    // panel body renders a CTA card in that state and adding tracks would
-    // produce silent ones (no samples to load).
-    if (packStatus !== 'current') {
+    // Hide the "+ Add" button until SOME library is installed — the stock pack
+    // OR at least one user-imported pack. In the no-library state the body
+    // renders a CTA card and adding tracks would produce silent ones.
+    if (packStatus !== 'current' && userPackCount === 0) {
       onHeaderContent(null);
       return () => { onHeaderContent(null); };
     }
@@ -686,6 +710,19 @@ export function DrumGeneratorPanel({
 
     onHeaderContent(
       <div className="flex gap-1">
+        {host.openSampleImportWizard && (
+          <button
+            data-testid="import-own-samples-drums-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              host.openSampleImportWizard?.('drums');
+            }}
+            title="Import your own drum samples from a folder"
+            className="px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent"
+          >
+            Import Samples
+          </button>
+        )}
         {host.listImportableTracks && (
           <button
             data-testid="import-from-scene-drums-button"
@@ -723,8 +760,8 @@ export function DrumGeneratorPanel({
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
-      needsContract, activeSceneId, tracks.length, handleAddTrack, onOpenContract,
-      host]);
+      userPackCount, needsContract, activeSceneId, tracks.length, handleAddTrack,
+      onOpenContract, host]);
 
   useEffect(() => {
     if (!onLoading) return;
@@ -1346,14 +1383,28 @@ export function DrumGeneratorPanel({
     );
   }
 
-  if (packStatus !== 'current') {
+  // No stock pack AND no user packs → CTA card, plus a path to import your own.
+  if (packStatus !== 'current' && userPackCount === 0) {
     return (
-      <SamplePackCTACard
-        host={host}
-        pack={packInfo}
-        status={packStatus}
-        onDownloadComplete={refreshPackStatus}
-      />
+      <div className="space-y-2">
+        <SamplePackCTACard
+          host={host}
+          pack={packInfo}
+          status={packStatus}
+          onDownloadComplete={refreshPackStatus}
+        />
+        {host.openSampleImportWizard && (
+          <div className="text-center">
+            <button
+              data-testid="import-own-samples-cta-drums"
+              onClick={() => host.openSampleImportWizard?.('drums')}
+              className="text-sas-muted text-xs hover:text-sas-accent transition-colors underline underline-offset-2"
+            >
+              …or import your own drum samples
+            </button>
+          </div>
+        )}
+      </div>
     );
   }
 
