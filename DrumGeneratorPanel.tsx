@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -109,6 +109,14 @@ export function DrumGeneratorPanel({
   onOpenContract,
   onExpandSelf,
 }: PluginUIProps): React.ReactElement {
+  // Cosmetic per-track peak meters. Poll while the panel is mounted + visible;
+  // NOT gated on transport state (this app plays via decks/clip-launcher, so the
+  // linear "is playing" flag is unreliable). Stopped tracks just read the floor.
+  // The host coalesces the read so playback always wins over the GUI. Older
+  // hosts (no getTrackLevels) degrade to no meter via the `supportsMeters` guard.
+  const supportsMeters = typeof host.getTrackLevels === 'function';
+  const trackLevels = useTrackLevels(host);
+
   const [tracks, setTracks] = useState<DrumTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -1474,6 +1482,7 @@ export function DrumGeneratorPanel({
         key={track.handle.id}
         drag={drag}
         track={{ id: track.handle.id, name: track.handle.name, role: track.role }}
+        levels={supportsMeters ? trackLevels : undefined}
         prompt={track.prompt}
         runtimeState={{
           muted: track.runtimeState.muted,
