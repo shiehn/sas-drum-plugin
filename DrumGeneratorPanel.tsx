@@ -8,7 +8,7 @@
  * loaded sample on every note-on.
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type {
   PluginUIProps,
   PluginTrackHandle,
@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -97,6 +97,14 @@ interface DrumTrackState {
   instrumentMissing: boolean;
 }
 
+// Crossfade tracks (transition scenes): shared metadata + parsing live in the
+// SDK (crossfade-meta.ts); only the live-track-bound resolved pair is panel-local.
+/** A crossfade pair resolved against live track state (both members present). */
+interface ResolvedCrossfadePair extends CrossfadePairMeta {
+  origin: DrumTrackState;
+  target: DrumTrackState;
+}
+
 export function DrumGeneratorPanel({
   host,
   activeSceneId,
@@ -121,6 +129,11 @@ export function DrumGeneratorPanel({
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [soundImportTarget, setSoundImportTarget] = useState<DrumTrackState | null>(null);
+  // Crossfade tracks (transition scenes): the "+ Crossfade" modal + parsed pair
+  // metadata for the active scene (members are normal tracks linked via scene-data).
+  const [crossfadeOpen, setCrossfadeOpen] = useState(false);
+  const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
+  const [isCreatingCrossfade, setIsCreatingCrossfade] = useState(false);
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
   const saveTimeoutRefs = useRef<Record<string, NodeJS.Timeout>>({});
@@ -298,6 +311,7 @@ export function DrumGeneratorPanel({
     const sceneAtStart = activeSceneId;
     if (!sceneAtStart) {
       setTracks([]);
+      setCrossfadePairsMeta([]);
       tracksLoadedForSceneRef.current = null;
       // No scene → not loading. Without this, a load that already set
       // isLoadingTracks=true and is then superseded by a flip to a null
@@ -453,6 +467,11 @@ export function DrumGeneratorPanel({
         } else if (ts.samplePath) {
           soundHistory.record(ts.handle.id, ts.samplePath, sampleNameForDisplay(ts.samplePath));
         }
+      }
+      // Group crossfade members (normal tracks linked by a shared groupId in
+      // scene-data) into pairs; the render layer excludes their standalone rows.
+      if (tracksLoadedForSceneRef.current === sceneAtStart) {
+        setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
       }
     } catch (error: unknown) {
       console.error('[DrumGeneratorPanel] Failed to load tracks:', error);
@@ -677,6 +696,115 @@ export function DrumGeneratorPanel({
     [host, activeSceneId, isConnected, tracks.length, kitResolver, applyDrumSound, soundHistory, loadTracks],
   );
 
+  // --- Create a crossfade pair (transition scenes) ----------------------
+  // Two drum tracks share ONE generated pattern; the top wears the ORIGIN kit
+  // sample, the bottom the TARGET's. One-action: generate → create both → write
+  // same MIDI → copy kits → equal-power volumes → persist. LIFO rollback. Throws
+  // on failure so the modal surfaces it.
+  const handleCreateCrossfade = useCallback(
+    async (origin: CrossfadeSelection, target: CrossfadeSelection): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (!isAuthenticated) throw new Error('Please sign in to generate the bridge.');
+      if (tracks.length + 2 > MAX_TRACKS) throw new Error('Not enough track slots for a crossfade.');
+
+      setIsCreatingCrossfade(true);
+      const created: PluginTrackHandle[] = [];
+      try {
+        const role = origin.role ?? target.role ?? '';
+
+        // 1. Generate ONE drum bridge clip (done before creating the empty tracks).
+        const mc = await host.getMusicalContext();
+        const genCtx = await host.getGenerationContext();
+        const concurrentBlock = formatConcurrentTracks(genCtx);
+        const userPrompt = [
+          concurrentBlock || undefined,
+          concurrentBlock ? '' : undefined,
+          `This is a TRANSITION bridge. Generate a ${role || 'drum'} drum-pattern MIDI clip over the transition that carries "${origin.name}" into "${target.name}".`,
+        ]
+          .filter((l): l is string => l !== undefined)
+          .join('\n');
+        const llm = await host.generateWithLLM({
+          system: buildDrumSystemPrompt(availableRoles),
+          user: userPrompt,
+          responseFormat: 'json',
+        });
+        const parsed = parseLLMDrumResponse(llm.content);
+        if (!parsed || parsed.notes.length === 0) {
+          throw new Error('The bridge generator returned no drum notes.');
+        }
+        // Drum MIDI: flatten pitch to 60 (sampler plays native pitch there); keep
+        // micro-timing (quantize:false), drop overlaps.
+        const flattened = parsed.notes.map((n) => ({ ...n, pitch: 60 }));
+        const notes = await host.postProcessMidi(flattened, { quantize: false, removeOverlaps: true });
+        const clip: MidiClipData = {
+          startTime: 0,
+          endTime: (mc.bars * 4 * 60) / mc.bpm,
+          tempo: mc.bpm,
+          notes,
+        };
+
+        // 2. Create the two layer tracks (drum tracks have no synth; sampler below).
+        const top = await host.createTrack({ name: `drum-${Date.now()}-xf-o` });
+        created.push(top);
+        const bottom = await host.createTrack({ name: `drum-${Date.now()}-xf-t` });
+        created.push(bottom);
+        if (role) {
+          await host.setTrackRole(top.id, role).catch(() => {});
+          await host.setTrackRole(bottom.id, role).catch(() => {});
+        }
+
+        // 3. SAME MIDI on both layers.
+        await host.writeMidiClip(top.id, clip);
+        await host.writeMidiClip(bottom.id, clip);
+
+        // 4. Copy each source kit sample onto its layer (exact sound; persist by
+        // the NEW track's dbId — engineToDbIdRef isn't populated until reload).
+        const copyDrumSound = async (newTrack: PluginTrackHandle, sourceDbId: string): Promise<string> => {
+          if (!host.getTrackSound) return 'default';
+          const snap = await host.getTrackSound(sourceDbId);
+          if (!snap || snap.kind !== 'sample') return 'default';
+          await host.setTrackDrumKit(newTrack.id, { samplePath: snap.samplePath });
+          await host.setSceneData(scene, `track:${newTrack.dbId}:samplePath`, snap.samplePath).catch(() => {});
+          return snap.label;
+        };
+        const originLabel = await copyDrumSound(top, origin.dbId);
+        const targetLabel = await copyDrumSound(bottom, target.dbId);
+
+        // 5. Equal-power center.
+        await host.setTrackVolume(top.id, EQUAL_POWER_GAIN).catch(() => {});
+        await host.setTrackVolume(bottom.id, EQUAL_POWER_GAIN).catch(() => {});
+
+        // 6. Persist the pairing.
+        const groupId = top.dbId;
+        const originMeta: CrossfadeMeta = {
+          groupId, slot: 'origin', partnerDbId: bottom.dbId, sourceTrackDbId: origin.dbId,
+          sourceSceneId: fromSceneId, sourceName: origin.name, soundLabel: originLabel, sliderPos: 0.5,
+        };
+        const targetMeta: CrossfadeMeta = {
+          groupId, slot: 'target', partnerDbId: top.dbId, sourceTrackDbId: target.dbId,
+          sourceSceneId: toSceneId, sourceName: target.name, soundLabel: targetLabel, sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${top.dbId}:crossfade`, originMeta);
+        await host.setSceneData(scene, `track:${bottom.dbId}:crossfade`, targetMeta);
+
+        await loadTracks(true);
+        host.showToast('success', 'Crossfade created', `${origin.name} → ${target.name}`);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) {
+          try { await host.deleteTrack(h.id); } catch { /* best effort */ }
+        }
+        throw err instanceof Error ? err : new Error(String(err));
+      } finally {
+        setIsCreatingCrossfade(false);
+      }
+    },
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableRoles, loadTracks],
+  );
+
   // Compose flow intentionally omitted — see the header-content comment
   // below. Reinstate this callback once `host.composeScene` is plugin-aware
   // (drum tracks owned by drum-generator + drum sampler auto-loaded).
@@ -718,6 +846,10 @@ export function DrumGeneratorPanel({
   // caller is drum-generator).
   const isBulkActive = !!(isComposing || placeholders.length > 0);
   const needsContract = !sceneContext?.hasContract;
+  const xfFromId = sceneContext?.transitionFromSceneId ?? null;
+  const xfToId = sceneContext?.transitionToSceneId ?? null;
+  const canCrossfade =
+    sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
   useEffect(() => {
     if (!onHeaderContent) return;
     // Hide the "+ Add" button until SOME library is installed — the stock pack
@@ -782,12 +914,32 @@ export function DrumGeneratorPanel({
         >
           Add Track
         </button>
+        {canCrossfade && (
+          <button
+            data-testid="add-crossfade-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              onExpandSelf?.();
+              setCrossfadeOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+            title="Crossfade an origin track into a target track over this transition"
+          >
+            + Crossfade
+          </button>
+        )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       userPackCount, needsContract, activeSceneId, tracks.length, handleAddTrack,
-      onOpenContract, host]);
+      onOpenContract, host, canCrossfade, isCreatingCrossfade, onExpandSelf]);
 
   useEffect(() => {
     if (!onLoading) return;
@@ -811,6 +963,43 @@ export function DrumGeneratorPanel({
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       host.showToast('error', 'Failed to delete track', msg);
+    }
+  }, [host, activeSceneId]);
+
+  // --- Crossfade group controls -----------------------------------------
+  // Mute/solo act on BOTH layers together; per-layer volume/pan reuse the normal
+  // handlers (members are normal tracks in `tracks`). Delete removes the whole
+  // pair + its scene-data keys (crossfade + samplePath).
+  const handleCrossfadeMute = useCallback((pair: ResolvedCrossfadePair): void => {
+    const newMuted = !pair.origin.runtimeState.muted;
+    for (const id of [pair.origin.handle.id, pair.target.handle.id]) {
+      setTracks(prev => prev.map(t => (t.handle.id === id ? { ...t, runtimeState: { ...t.runtimeState, muted: newMuted } } : t)));
+      host.setTrackMute(id, newMuted).catch(() => {});
+    }
+  }, [host]);
+
+  const handleCrossfadeSolo = useCallback((pair: ResolvedCrossfadePair): void => {
+    const newSolo = !pair.origin.runtimeState.solo;
+    for (const id of [pair.origin.handle.id, pair.target.handle.id]) {
+      setTracks(prev => prev.map(t => (t.handle.id === id ? { ...t, runtimeState: { ...t.runtimeState, solo: newSolo } } : t)));
+      host.setTrackSolo(id, newSolo).catch(() => {});
+    }
+  }, [host]);
+
+  const handleCrossfadeDelete = useCallback(async (pair: ResolvedCrossfadePair): Promise<void> => {
+    try {
+      for (const member of [pair.origin, pair.target]) {
+        await host.deleteTrack(member.handle.id);
+        if (activeSceneId) {
+          await host.deleteSceneData(activeSceneId, `track:${member.handle.dbId}:crossfade`);
+          await host.deleteSceneData(activeSceneId, `track:${member.handle.dbId}:samplePath`).catch(() => {});
+        }
+      }
+      setCrossfadePairsMeta(prev => prev.filter(p => p.groupId !== pair.groupId));
+      setTracks(prev => prev.filter(t => t.handle.id !== pair.origin.handle.id && t.handle.id !== pair.target.handle.id));
+      host.showToast('success', 'Crossfade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
     }
   }, [host, activeSceneId]);
 
@@ -1326,6 +1515,25 @@ export function DrumGeneratorPanel({
     });
   }, [host]);
 
+  // Resolve crossfade pairs against live track state. Only COMPLETE pairs (both
+  // members present in `tracks`) group into a CrossfadeTrackRow; a half-broken
+  // pair's surviving member falls back to a normal row (not excluded).
+  const { resolvedCrossfadePairs, crossfadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const pairs: ResolvedCrossfadePair[] = [];
+    const members = new Set<string>();
+    for (const p of crossfadePairsMeta) {
+      const origin = byDbId.get(p.originDbId);
+      const target = byDbId.get(p.targetDbId);
+      if (origin && target) {
+        pairs.push({ ...p, origin, target });
+        members.add(p.originDbId);
+        members.add(p.targetDbId);
+      }
+    }
+    return { resolvedCrossfadePairs: pairs, crossfadeMemberDbIds: members };
+  }, [tracks, crossfadePairsMeta]);
+
   // --- Render -----------------------------------------------------------
 
   if (!activeSceneId) {
@@ -1458,10 +1666,59 @@ export function DrumGeneratorPanel({
           testIdPrefix="drums-sound-import"
         />
       )}
+      {canCrossfade && xfFromId && xfToId && (
+        <CrossfadeModal
+          host={host}
+          open={crossfadeOpen}
+          fromSceneId={xfFromId}
+          toSceneId={xfToId}
+          onClose={() => setCrossfadeOpen(false)}
+          onCreate={handleCreateCrossfade}
+          testIdPrefix="drums-crossfade"
+        />
+      )}
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
-        tracks.map((track: DrumTrackState, index: number) => renderTrackRow(track, reorder.dragPropsFor(index)))
+        <>
+          {resolvedCrossfadePairs.map((pair) => (
+            <CrossfadeTrackRow
+              key={pair.groupId}
+              accentColor="#9333EA"
+              levels={supportsMeters ? trackLevels : undefined}
+              sliderPos={pair.sliderPos}
+              origin={{
+                trackId: pair.origin.handle.id,
+                name: pair.origin.handle.name,
+                role: pair.origin.role,
+                sourceName: pair.originSourceName,
+                soundLabel: pair.originSoundLabel,
+                runtimeState: pair.origin.runtimeState,
+              }}
+              target={{
+                trackId: pair.target.handle.id,
+                name: pair.target.handle.name,
+                role: pair.target.role,
+                sourceName: pair.targetSourceName,
+                soundLabel: pair.targetSoundLabel,
+                runtimeState: pair.target.runtimeState,
+              }}
+              onMuteToggle={() => handleCrossfadeMute(pair)}
+              onSoloToggle={() => handleCrossfadeSolo(pair)}
+              onVolumeChange={(slot: CrossfadeSlot, vol: number) =>
+                handleVolumeChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, vol)
+              }
+              onPanChange={(slot: CrossfadeSlot, pan: number) =>
+                handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan)
+              }
+              onDelete={() => handleCrossfadeDelete(pair)}
+            />
+          ))}
+          {tracks.map((track: DrumTrackState, index: number) =>
+            crossfadeMemberDbIds.has(track.handle.dbId)
+              ? null
+              : renderTrackRow(track, reorder.dragPropsFor(index)))}
+        </>
       )}
 
       {!isLoadingTracks && tracks.length > 0 && (() => {
