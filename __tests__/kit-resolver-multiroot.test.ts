@@ -145,3 +145,38 @@ describe('kit-resolver multi-root', () => {
     );
   });
 });
+
+describe('kit-resolver tempo-variant exclusion', () => {
+  // Stock packs interleave `<base>_v<bpm>.wav` tempo-stretched loop variants
+  // into the drum role folders. They are useless for native-pitch one-shots,
+  // so the scan must drop them — from BOTH the pick pool and role discovery.
+  const ROOT = '/packs/drums';
+  const FILES = [
+    '/packs/drums/kick/kick-base-a.wav',
+    '/packs/drums/kick/kick-base-a_v128.wav',
+    '/packs/drums/kick/kick-base-a_v133.wav',
+    '/packs/drums/kick/kick-base-b.wav',
+    // A role whose ONLY non-variant file is the base — proves a role is never
+    // emptied as long as it has at least one base sample.
+    '/packs/drums/808/808-base.wav',
+    '/packs/drums/808/808-base_v130.wav',
+  ];
+
+  function makeVariantHost(): PluginHost {
+    const listAudioFiles = jest.fn(async (root: string) => (root === ROOT ? FILES : []));
+    return { listAudioFiles, readTextFile: jest.fn(async () => null) } as unknown as PluginHost;
+  }
+
+  it('never returns a `_vNNN` variant from pick(), only base samples', async () => {
+    const kicks = await drainRole(makeVariantHost(), ROOT, 'kick');
+    expect(kicks).toEqual(
+      new Set(['/packs/drums/kick/kick-base-a.wav', '/packs/drums/kick/kick-base-b.wav']),
+    );
+  });
+
+  it('keeps roles whose base samples survive (808 still discoverable)', async () => {
+    const resolver = createKitResolver(makeVariantHost(), ROOT, { rng: () => 0 });
+    expect(await resolver.getDiscoveredRoles()).toEqual(['808', 'kick']);
+    expect(await resolver.pick('808')).toBe('/packs/drums/808/808-base.wav');
+  });
+});

@@ -22,6 +22,19 @@ import { scorePromptMatch, pickTopKWeighted } from '@signalsandsorcery/plugin-sd
 import type { PluginHost } from '@signalsandsorcery/plugin-sdk';
 
 /**
+ * Tempo-stretched loop variants are named `<base>_v<bpm>.wav` (e.g.
+ * `kick-1bad7136_v129.wav`) by the loop/tempo system. They have NO place in a
+ * drum one-shot pool: the drum sampler triggers every note at native pitch
+ * (see drum-system-prompt), so a time-stretched copy sounds identical to its
+ * base at best and adds nothing. Left in, they badly skew selection — in a
+ * stock pack the `kick`/`808`/`tom-*`/`sub-drop` folders are ~50–85% variants,
+ * so a random pick lands on a pointless stretched file most of the time. Every
+ * affected role still has 150+ base samples, so excluding variants never
+ * empties a role. Matches a `_v` followed by one-or-more digits before `.wav`.
+ */
+const DRUM_VARIANT_RE = /_v\d+\.wav$/iu;
+
+/**
  * Source of the library root(s) for createKitResolver.
  *
  *   - string                                 — single root, used directly
@@ -180,6 +193,10 @@ export function createKitResolver(
             continue;
           }
           for (const p of paths) {
+            // Tempo-stretched loop variants are useless for native-pitch drum
+            // one-shots — drop them so they never reach a role pool (which
+            // generate/shuffle draw from) or role discovery. See DRUM_VARIANT_RE.
+            if (DRUM_VARIANT_RE.test(p)) continue;
             // The folder we care about is the immediate parent dir name —
             // e.g. ".../processed/kick/kick-12345.wav" → "kick".
             const parts = p.split('/');
