@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, buildCrossfadeInpaintPrompt, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -696,6 +696,23 @@ export function DrumGeneratorPanel({
     [host, activeSceneId, isConnected, tracks.length, kitResolver, applyDrumSound, soundHistory, loadTracks],
   );
 
+  // Apply the crossfade volume automation: origin fades out, target fades in
+  // across the loop (equal-power, crossover at sliderPos). Falls back to a static
+  // equal-power blend on hosts without setTrackVolumeAutomation.
+  const applyCrossfadeAutomation = useCallback(
+    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number): Promise<void> => {
+      if (host.setTrackVolumeAutomation) {
+        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos);
+        await host.setTrackVolumeAutomation(originTrackId, curves.origin).catch(() => {});
+        await host.setTrackVolumeAutomation(targetTrackId, curves.target).catch(() => {});
+      } else {
+        await host.setTrackVolume(originTrackId, EQUAL_POWER_GAIN).catch(() => {});
+        await host.setTrackVolume(targetTrackId, EQUAL_POWER_GAIN).catch(() => {});
+      }
+    },
+    [host],
+  );
+
   // --- Create a crossfade pair (transition scenes) ----------------------
   // Two drum tracks share ONE generated pattern; the top wears the ORIGIN kit
   // sample, the bottom the TARGET's. One-action: generate → create both → write
@@ -786,9 +803,9 @@ export function DrumGeneratorPanel({
         const originLabel = await copyDrumSound(top, origin.dbId);
         const targetLabel = await copyDrumSound(bottom, target.dbId);
 
-        // 5. Equal-power center.
-        await host.setTrackVolume(top.id, EQUAL_POWER_GAIN).catch(() => {});
-        await host.setTrackVolume(bottom.id, EQUAL_POWER_GAIN).catch(() => {});
+        // 5. Crossfade volume automation (origin fades out, target fades in
+        // across the loop; equal-power, crossover at the centered slider).
+        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5);
 
         // 6. Persist the pairing.
         const groupId = top.dbId;
@@ -814,7 +831,7 @@ export function DrumGeneratorPanel({
         setIsCreatingCrossfade(false);
       }
     },
-    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableRoles, loadTracks],
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableRoles, applyCrossfadeAutomation, loadTracks],
   );
 
   // Compose flow intentionally omitted — see the header-content comment
@@ -1014,6 +1031,27 @@ export function DrumGeneratorPanel({
       host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
     }
   }, [host, activeSceneId]);
+
+  // Drag the crossfade fader: optimistic UI now, debounced engine apply + persist
+  // of sliderPos (recomputes the equal-power curves at the new crossover point).
+  const crossfadeSliderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const handleCrossfadeSlider = useCallback((pair: ResolvedCrossfadePair, pos: number): void => {
+    setCrossfadePairsMeta(prev => prev.map(p => (p.groupId === pair.groupId ? { ...p, sliderPos: pos } : p)));
+    if (crossfadeSliderTimers.current[pair.groupId]) clearTimeout(crossfadeSliderTimers.current[pair.groupId]);
+    crossfadeSliderTimers.current[pair.groupId] = setTimeout(() => {
+      void (async () => {
+        const mc = await host.getMusicalContext();
+        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos);
+        if (activeSceneId) {
+          const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
+          for (const dbId of [pair.originDbId, pair.targetDbId]) {
+            const meta = asCrossfadeMeta(sceneData[`track:${dbId}:crossfade`]);
+            if (meta) host.setSceneData(activeSceneId, `track:${dbId}:crossfade`, { ...meta, sliderPos: pos }).catch(() => {});
+          }
+        }
+      })();
+    }, 200);
+  }, [host, activeSceneId, applyCrossfadeAutomation]);
 
   // --- Update prompt (debounced save) -----------------------------------
   const handlePromptChange = useCallback((trackId: string, prompt: string): void => {
@@ -1723,6 +1761,7 @@ export function DrumGeneratorPanel({
               onPanChange={(slot: CrossfadeSlot, pan: number) =>
                 handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan)
               }
+              onSliderChange={(pos: number) => handleCrossfadeSlider(pair, pos)}
               onDelete={() => handleCrossfadeDelete(pair)}
             />
           ))}
