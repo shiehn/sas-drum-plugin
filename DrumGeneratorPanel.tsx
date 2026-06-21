@@ -731,7 +731,7 @@ export function DrumGeneratorPanel({
       setIsCreatingCrossfade(true);
       const created: PluginTrackHandle[] = [];
       try {
-        const role = origin.role ?? target.role ?? '';
+        const role = target.role ?? origin.role ?? ''; // bridge heads toward the target
 
         // 1. Generate ONE drum bridge clip via MIDI INPAINTING: morph the ORIGIN
         // drum pattern into the TARGET across the transition. The harmonic frame
@@ -1723,6 +1723,7 @@ export function DrumGeneratorPanel({
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           onClose={() => setCrossfadeOpen(false)}
+          excludeSourceDbIds={crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId])}
           onCreate={handleCreateCrossfade}
           testIdPrefix="drums-crossfade"
         />
