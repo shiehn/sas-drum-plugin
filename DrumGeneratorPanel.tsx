@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -1799,6 +1799,34 @@ export function DrumGeneratorPanel({
     }
     return { resolvedFades: list, fadeMemberDbIds: members };
   }, [tracks, fadesMeta]);
+
+  // Auto re-sync drifted source kits. A crossfade/fade COPIES each source's
+  // sample onto its layer at creation; if the source track's kit later changes,
+  // re-copy it on the next load (the layer is locked, so divergence == drift).
+  useEffect(() => {
+    if (!host.getTrackSound || (resolvedCrossfadePairs.length === 0 && resolvedFades.length === 0)) return;
+    let cancelled = false;
+    const reapplyIfDrifted = async (layerTrackId: string, layerDbId: string, sourceDbId: string): Promise<void> => {
+      if (!host.getTrackSound || cancelled) return;
+      const [sourceSnap, layerSnap] = await Promise.all([
+        host.getTrackSound(sourceDbId),
+        host.getTrackSound(layerDbId),
+      ]);
+      if (cancelled || !sourceSnap || sourceSnap.kind !== 'sample') return;
+      if (soundIdentity(sourceSnap) === soundIdentity(layerSnap)) return;
+      await applyDrumSound(layerTrackId, sourceSnap.samplePath).catch(() => {});
+    };
+    void (async () => {
+      for (const pair of resolvedCrossfadePairs) {
+        await reapplyIfDrifted(pair.origin.handle.id, pair.origin.handle.dbId, pair.originSourceDbId);
+        await reapplyIfDrifted(pair.target.handle.id, pair.target.handle.dbId, pair.targetSourceDbId);
+      }
+      for (const fade of resolvedFades) {
+        await reapplyIfDrifted(fade.track.handle.id, fade.track.handle.dbId, fade.meta.sourceTrackDbId);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [resolvedCrossfadePairs, resolvedFades, host, applyDrumSound]);
 
   // Re-apply each fade's one-sided volume curve on load (not engine-persisted;
   // recompute from sliderPos + gesture). Keyed by engine id (fires once per
