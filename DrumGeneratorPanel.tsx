@@ -137,7 +137,7 @@ export function DrumGeneratorPanel({
   // Transition Designer (transition scenes): the single board replacing the
   // per-pair "+ Crossfade"/"+ Fade" modals, plus parsed pair metadata for the
   // active scene (members are normal tracks linked via scene-data).
-  const [designerOpen, setDesignerOpen] = useState(false);
+  const [designerView, setDesignerView] = useState(false);
   const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
   const [isCreatingCrossfade, setIsCreatingCrossfade] = useState(false);
   // A fade is a crossfade with one empty endpoint — a lone track that fades in
@@ -1015,6 +1015,10 @@ export function DrumGeneratorPanel({
   const xfToId = sceneContext?.transitionToSceneId ?? null;
   const canCrossfade =
     sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
+  // Leaving a transition scene drops back to the Tracks view (the toggle is hidden).
+  useEffect(() => {
+    if (!canCrossfade) setDesignerView(false);
+  }, [canCrossfade]);
   useEffect(() => {
     if (!onHeaderContent) return;
     // Hide the "+ Add" button until SOME library is installed — the stock pack
@@ -1032,8 +1036,8 @@ export function DrumGeneratorPanel({
       isAddingTrack;
 
     onHeaderContent(
-      <div className="flex gap-1">
-        {host.openSampleImportWizard && (
+      <div className="flex gap-1 items-center">
+        {(!canCrossfade || !designerView) && host.openSampleImportWizard && (
           <button
             data-testid="import-own-samples-drums-button"
             onClick={(e: React.MouseEvent) => {
@@ -1046,7 +1050,7 @@ export function DrumGeneratorPanel({
             Import Samples
           </button>
         )}
-        {host.listImportableTracks && (
+        {(!canCrossfade || !designerView) && host.listImportableTracks && (
           <button
             data-testid="import-from-scene-drums-button"
             onClick={(e: React.MouseEvent) => {
@@ -1064,47 +1068,65 @@ export function DrumGeneratorPanel({
             Import Track
           </button>
         )}
-        <button
-          data-testid="add-drum-track-button"
-          onClick={(e: React.MouseEvent) => {
-            e.stopPropagation();
-            if (needsContract) { onOpenContract?.(); return; }
-            handleAddTrack();
-          }}
-          className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-            addDisabled
-              ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-              : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
-          }`}
-        >
-          Add Track
-        </button>
-        {canCrossfade && (
+        {(!canCrossfade || !designerView) && (
           <button
-            data-testid="open-transition-designer-button"
+            data-testid="add-drum-track-button"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
               if (needsContract) { onOpenContract?.(); return; }
-              onExpandSelf?.();
-              setDesignerOpen(true);
+              handleAddTrack();
             }}
-            disabled={!activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-              !activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade
+              addDisabled
                 ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+                : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
             }`}
-            title="Arrange crossfades & fades between the two scenes"
           >
-            Transition Designer
+            Add Track
           </button>
+        )}
+        {canCrossfade && (
+          <div
+            className="flex items-center rounded-sm border border-sas-border overflow-hidden"
+            data-testid="drums-view-toggle"
+          >
+            <button
+              data-testid="drums-view-tracks"
+              onClick={(e: React.MouseEvent) => { e.stopPropagation(); setDesignerView(false); }}
+              className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                !designerView
+                  ? 'bg-sas-accent text-sas-bg'
+                  : 'bg-sas-panel-alt text-sas-muted hover:text-sas-accent'
+              }`}
+            >
+              Tracks
+            </button>
+            <button
+              data-testid="drums-view-transition"
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                if (needsContract) { onOpenContract?.(); return; }
+                onExpandSelf?.();
+                setDesignerView(true);
+              }}
+              disabled={needsContract}
+              className={`px-2 py-0.5 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+                designerView
+                  ? 'bg-sas-accent text-sas-bg'
+                  : 'bg-sas-panel-alt text-sas-muted hover:text-sas-accent'
+              }`}
+              title="Arrange crossfades & fades between the two scenes"
+            >
+              Transition
+            </button>
+          </div>
         )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       userPackCount, needsContract, activeSceneId, tracks.length, handleAddTrack,
-      onOpenContract, host, canCrossfade, isCreatingCrossfade, isCreatingFade, onExpandSelf]);
+      onOpenContract, host, canCrossfade, designerView, onExpandSelf]);
 
   useEffect(() => {
     if (!onLoading) return;
@@ -1916,14 +1938,12 @@ export function DrumGeneratorPanel({
           testIdPrefix="drums-sound-import"
         />
       )}
-      {canCrossfade && xfFromId && xfToId && (
+      {designerView && canCrossfade && xfFromId && xfToId ? (
         <TransitionDesigner
           host={host}
-          open={designerOpen}
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           transitionSceneId={activeSceneId ?? ''}
-          onClose={() => setDesignerOpen(false)}
           excludeSourceDbIds={[
             ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
             ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
@@ -1933,8 +1953,7 @@ export function DrumGeneratorPanel({
           familyLabel="Drums"
           testIdPrefix="drums-transition-designer"
         />
-      )}
-      {isLoadingTracks ? (
+      ) : isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
         <>
