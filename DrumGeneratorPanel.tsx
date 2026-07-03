@@ -2155,6 +2155,7 @@ export function DrumGeneratorPanel({
         onVolumeChange={(vol: number) => handleVolumeChange(track.handle.id, vol)}
         onPanChange={(pan: number) => handlePanChange(track.handle.id, pan)}
         onFxToggle={(cat: FxCategory, enabled: boolean) => handleFxToggle(track.handle.id, cat, enabled)}
+        externalFxHost={host}
         onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
         onFxDryWetChange={(cat: FxCategory, val: number) => handleFxDryWetChange(track.handle.id, cat, val)}
         onToggleFxDrawer={() => toggleFxDrawer(track.handle.id)}
