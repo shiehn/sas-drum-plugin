@@ -47,6 +47,7 @@ Rules:
 
 Style guidance:
 - Match the bar count and tempo from the musical context.
+- If "Concurrent tracks in scene" or "REFERENCE TRACKS" are listed, interlock with them: line the kick up with (or deliberately around) the bassline's root hits, keep snare/hat accents out of the way of busy melodic syncopation, and leave space where the arrangement is already dense.
 - A "4 on the floor" kick = quarter notes on beats 1, 2, 3, 4.
 - A "backbeat snare" = quarter notes on beats 2 and 4.
 - 8th-note hats = 8 notes per bar (every 0.5 beats); 16th = 16 per bar (every 0.25 beats).
