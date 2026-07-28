@@ -434,8 +434,11 @@ export function DrumGeneratorPanel({
         // Re-arm the drum sampler with the persisted sample on scene load.
         // The sampler instance is recreated when projects open; we have to
         // restore the loaded sample for playback to produce sound.
+        // `restore: true` marks this as a replay, NOT a sound edit — without
+        // it, every scene switch auto-unfroze frozen drum tracks (the host's
+        // freeze gate treats a kit set as an audible edit).
         if (samplePath) {
-          host.setTrackDrumKit(handle.id, { samplePath }).catch((err: unknown) => {
+          host.setTrackDrumKit(handle.id, { samplePath, restore: true }).catch((err: unknown) => {
             console.warn('[DrumGeneratorPanel] Failed to re-arm sampler on load:', err);
           });
         }
