@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
@@ -87,11 +87,14 @@ interface DrumTrackState {
   // Piano-roll edit state. `editNotes` is the live, editable copy of the
   // track's MIDI (loaded lazily when the Edit tab is first opened, or seeded
   // from a fresh generation). `editBars`/`editBpm` size the grid + the save
-  // span. Drum MIDI is flattened to pitch 60, so the roll's pitch axis is
-  // cosmetic here. See loadEditNotes / handleNotesChange.
+  // span; `editBeatsPerBar` is the scene meter's QUARTER notes per bar
+  // (4 in 4/4; panelQuarterNotesPerBar). Drum MIDI is flattened to pitch 60,
+  // so the roll's pitch axis is cosmetic here. See loadEditNotes /
+  // handleNotesChange.
   editNotes: PluginMidiNote[];
   editBars: number;
   editBpm: number;
+  editBeatsPerBar: number;
   instrumentPluginId: string | null;
   instrumentName: string | null;
   instrumentMissing: boolean;
@@ -461,6 +464,7 @@ export function DrumGeneratorPanel({
           editNotes: [],
           editBars: 4,
           editBpm: 120,
+          editBeatsPerBar: 4,
           instrumentPluginId: handle.instrumentPluginId ?? null,
           instrumentName: handle.instrumentName ?? null,
           instrumentMissing,
@@ -482,7 +486,7 @@ export function DrumGeneratorPanel({
         return trackStates.map(ts => {
           const carry = prevByDbId.get(ts.handle.dbId);
           return carry
-            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm }
+            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm, editBeatsPerBar: carry.editBeatsPerBar }
             : ts;
         });
       });
@@ -658,6 +662,7 @@ export function DrumGeneratorPanel({
         editNotes: [],
         editBars: 4,
         editBpm: 120,
+        editBeatsPerBar: 4,
         instrumentPluginId: null,
         instrumentName: null,
         instrumentMissing: false,
@@ -700,7 +705,7 @@ export function DrumGeneratorPanel({
           const mc = await host.getMusicalContext();
           await host.writeMidiClip(handle.id, {
             startTime: 0,
-            endTime: (mc.bars * 4 * 60) / mc.bpm,
+            endTime: panelClipEndSeconds(mc),
             tempo: mc.bpm,
             notes,
           });
@@ -727,11 +732,12 @@ export function DrumGeneratorPanel({
 
   // Apply the crossfade volume automation: origin fades out, target fades in
   // across the loop (equal-power, crossover at sliderPos). Falls back to a static
-  // equal-power blend on hosts without setTrackVolumeAutomation.
+  // equal-power blend on hosts without setTrackVolumeAutomation. `timeSignature`
+  // sizes the loop span per the scene meter (omitted = 4/4-identical).
   const applyCrossfadeAutomation = useCallback(
-    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number): Promise<void> => {
+    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number, timeSignature?: string): Promise<void> => {
       if (host.setTrackVolumeAutomation) {
-        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos);
+        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos, undefined, timeSignature);
         await host.setTrackVolumeAutomation(originTrackId, curves.origin).catch(() => {});
         await host.setTrackVolumeAutomation(targetTrackId, curves.target).catch(() => {});
       } else {
@@ -752,9 +758,10 @@ export function DrumGeneratorPanel({
       bpm: number,
       sliderPos: number,
       gesture: FadeGesture,
+      timeSignature?: string,
     ): Promise<void> => {
       if (!host.setTrackVolumeAutomation) return;
-      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture);
+      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture, undefined, timeSignature);
       await host.setTrackVolumeAutomation(trackId, points).catch(() => {});
     },
     [host],
@@ -804,7 +811,7 @@ export function DrumGeneratorPanel({
           percussive: true,
         });
         const llm = await host.generateWithLLM({
-          system: buildDrumSystemPrompt(availableRoles),
+          system: buildDrumSystemPrompt(availableRoles, panelMeter(mc)),
           user: userPrompt,
           responseFormat: 'json',
         });
@@ -818,7 +825,7 @@ export function DrumGeneratorPanel({
         const notes = await host.postProcessMidi(flattened, { quantize: false, removeOverlaps: true });
         const clip: MidiClipData = {
           startTime: 0,
-          endTime: (mc.bars * 4 * 60) / mc.bpm,
+          endTime: panelClipEndSeconds(mc),
           tempo: mc.bpm,
           notes,
         };
@@ -852,7 +859,7 @@ export function DrumGeneratorPanel({
 
         // 5. Crossfade volume automation (origin fades out, target fades in
         // across the loop; equal-power, crossover at the centered slider).
-        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5);
+        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5, panelMeter(mc));
 
         // 6. Persist the pairing.
         const groupId = top.dbId;
@@ -922,7 +929,7 @@ export function DrumGeneratorPanel({
           percussive: true,
         });
         const llm = await host.generateWithLLM({
-          system: buildDrumSystemPrompt(availableRoles),
+          system: buildDrumSystemPrompt(availableRoles, panelMeter(mc)),
           user: userPrompt,
           responseFormat: 'json',
         });
@@ -933,7 +940,7 @@ export function DrumGeneratorPanel({
         // Drum MIDI: flatten pitch to 60; keep micro-timing (quantize:false).
         const flattened = parsed.notes.map((n) => ({ ...n, pitch: 60 }));
         const notes = await host.postProcessMidi(flattened, { quantize: false, removeOverlaps: true });
-        const clip: MidiClipData = { startTime: 0, endTime: (mc.bars * 4 * 60) / mc.bpm, tempo: mc.bpm, notes };
+        const clip: MidiClipData = { startTime: 0, endTime: panelClipEndSeconds(mc), tempo: mc.bpm, notes };
 
         // 2. Create ONE track (drum tracks have no synth; sampler below).
         const track = await host.createTrack({ name: `drum-${Date.now()}-fade-${direction}` });
@@ -955,7 +962,7 @@ export function DrumGeneratorPanel({
         }
 
         // 5. One-sided volume curve (centered slider).
-        await applyFadeAutomation(track.id, direction, mc.bars, mc.bpm, 0.5, gesture);
+        await applyFadeAutomation(track.id, direction, mc.bars, mc.bpm, 0.5, gesture, panelMeter(mc));
         appliedFadeAutomationRef.current.add(track.id);
 
         // 6. Persist the fade metadata.
@@ -1220,7 +1227,7 @@ export function DrumGeneratorPanel({
     crossfadeSliderTimers.current[pair.groupId] = setTimeout(() => {
       void (async () => {
         const mc = await host.getMusicalContext();
-        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos);
+        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos, panelMeter(mc));
         if (activeSceneId) {
           const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
           for (const dbId of [pair.originDbId, pair.targetDbId]) {
@@ -1257,7 +1264,7 @@ export function DrumGeneratorPanel({
     fadeSliderTimers.current[fade.dbId] = setTimeout(() => {
       void (async () => {
         const mc = await host.getMusicalContext();
-        await applyFadeAutomation(fade.track.handle.id, fade.meta.direction, mc.bars, mc.bpm, pos, fade.meta.gesture);
+        await applyFadeAutomation(fade.track.handle.id, fade.meta.direction, mc.bars, mc.bpm, pos, fade.meta.gesture, panelMeter(mc));
         if (activeSceneId) {
           const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
           const meta = asFadeMeta(sceneData[`track:${fade.dbId}:fade`]);
@@ -1320,7 +1327,8 @@ export function DrumGeneratorPanel({
         // Phase 0.8: roles are FS-discovered now. Pass the live list so the
         // LLM picks from real on-disk folder names (e.g. "kick", "hat-closed")
         // instead of the old grouped taxonomy ("kicks", "hats", ...).
-        system: buildDrumSystemPrompt(availableRoles),
+        // P8a: the scene meter reshapes the rhythm-idiom lines (4/4 = legacy).
+        system: buildDrumSystemPrompt(availableRoles, panelMeter(musicalContext)),
         user: userPrompt,
         responseFormat: 'json',
       });
@@ -1353,7 +1361,7 @@ export function DrumGeneratorPanel({
 
       const clipData: MidiClipData = {
         startTime: 0,
-        endTime: (musicalContext.bars * 4 * 60) / musicalContext.bpm,
+        endTime: panelClipEndSeconds(musicalContext),
         tempo: musicalContext.bpm,
         notes: processedNotes,
       };
@@ -1415,6 +1423,7 @@ export function DrumGeneratorPanel({
               // (flattened to pitch 60 like all drum MIDI). The Edit tab opens with
               // no round-trip and won't clobber these.
               editNotes: processedNotes, editBars: musicalContext.bars, editBpm: musicalContext.bpm,
+              editBeatsPerBar: panelQuarterNotesPerBar(musicalContext),
             }
           : t
       ));
@@ -1621,7 +1630,7 @@ export function DrumGeneratorPanel({
       }
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId
-          ? { ...t, editNotes: notes, editBars: mc.bars, editBpm: mc.bpm }
+          ? { ...t, editNotes: notes, editBars: mc.bars, editBpm: mc.bpm, editBeatsPerBar: panelQuarterNotesPerBar(mc) }
           : t
       ));
     } catch (err: unknown) {
@@ -1648,7 +1657,7 @@ export function DrumGeneratorPanel({
             const mc = await host.getMusicalContext();
             await host.writeMidiClip(trackId, {
               startTime: 0,
-              endTime: (mc.bars * 4 * 60) / mc.bpm,
+              endTime: panelClipEndSeconds(mc),
               tempo: mc.bpm,
               notes,
             });
@@ -1850,7 +1859,7 @@ export function DrumGeneratorPanel({
         const id = fade.track.handle.id;
         if (appliedFadeAutomationRef.current.has(id)) continue;
         appliedFadeAutomationRef.current.add(id);
-        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture);
+        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture, panelMeter(mc));
       }
     })();
   }, [resolvedFades, host, applyFadeAutomation]);
@@ -2180,6 +2189,7 @@ export function DrumGeneratorPanel({
         onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
         editBars={track.editBars}
         editBpm={track.editBpm}
+        editBeatsPerBar={track.editBeatsPerBar}
         editSnap={0.25}
         onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
       />
