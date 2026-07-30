@@ -1,12 +1,13 @@
 /**
  * Meter-awareness of the drum system prompt (P8a multi-time-signature).
  *
- * BYTE-IDENTITY PIN: the snapshot below was recorded from the PRE-meter
- * implementation (`buildDrumSystemPrompt(roles)` with no meter parameter).
- * After the meter parameter landed, the 4/4 prompt — with the parameter
- * omitted OR passed explicitly as '4/4' — must still match that snapshot
- * byte-for-byte. Never `--ci`-update this snapshot as part of a meter
- * change; a diff here means 4/4 behavior drifted.
+ * BYTE-IDENTITY PIN: the snapshot pins the canonical 4/4 prompt — with the
+ * meter parameter omitted OR passed explicitly as '4/4' — byte-for-byte.
+ * Originally recorded from the PRE-meter implementation; last deliberately
+ * revised for the hat-interplay style bullet (2026-07-29, hand-edited snap).
+ * Never `--ci`-update this snapshot as part of a METER change; a diff here
+ * means 4/4 behavior drifted. Any intentional prompt revision must hand-edit
+ * the snap and update this note.
  */
 import { describe, it, expect } from '@jest/globals';
 import { buildDrumSystemPrompt } from '../src/drum-system-prompt';
@@ -69,5 +70,13 @@ describe('buildDrumSystemPrompt — non-4/4 meters', () => {
     expect(prompt).toContain('pitch: ALWAYS 60');
     expect(prompt).toContain('does NOT quantize');
     expect(prompt).toContain(SAMPLE_ROLES.join(', '));
+  });
+
+  it('the hat-interplay idiom bullet is present in every meter', () => {
+    for (const meter of [undefined, '4/4', '3/4', '6/8', '7/8']) {
+      const prompt = buildDrumSystemPrompt(SAMPLE_ROLES, meter);
+      expect(prompt).toContain('Hi-hat interplay: "hat-open" and "hat-closed" tracks act as ONE physical hi-hat.');
+      expect(prompt).toContain('ring length is computed for you');
+    }
   });
 });

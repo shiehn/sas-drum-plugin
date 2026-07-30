@@ -87,5 +87,6 @@ ${barCountLine}
 - If "Concurrent tracks in scene" or "REFERENCE TRACKS" are listed, interlock with them: line the kick up with (or deliberately around) the bassline's root hits, keep snare/hat accents out of the way of busy melodic syncopation, and leave space where the arrangement is already dense.
 ${rhythmIdiomLines}
 - Vary velocity to create groove — never use a constant velocity for an entire pattern.
-- Keep one track focused on one role — don't try to fit kick AND snare on the same track.${meterRulesBlock}`;
+- Keep one track focused on one role — don't try to fit kick AND snare on the same track.
+- Hi-hat interplay: "hat-open" and "hat-closed" tracks act as ONE physical hi-hat. The plugin automatically removes a closed hit that lands on an open hit's step and chokes each open ring at the next hat hit — place open hats exactly where the groove wants them (even on top of an existing closed pattern), and don't shorten hat-open durations to dodge collisions; ring length is computed for you.${meterRulesBlock}`;
 }

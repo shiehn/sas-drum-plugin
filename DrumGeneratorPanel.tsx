@@ -16,6 +16,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
   MidiClipData,
+  MusicalContext,
   PluginMidiNote,
   BulkAddPlaceholderTrack,
   InstrumentDescriptor,
@@ -31,6 +32,21 @@ import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 // folders actually exist under the library root.
 import { createKitResolver } from './src/kit-resolver';
 import { parseLLMDrumResponse } from './src/parse-llm-response';
+// Hat interplay: open/closed hat tracks act as ONE physical hi-hat. The
+// authored pattern ("source") persists in scene data; clips hold the resolved
+// projection recomputed on every hat-affecting change (see src/hat-interplay).
+import { hatArticulationForRole } from './src/hat-interplay';
+import { mergeResolvedEditIntoSource } from './src/hat-edit-merge';
+import {
+  HAT_GROUP_SIG_KEY,
+  applyHatInterplay,
+  computeHatGroupSig,
+  hatSourceKey,
+  resolveCurrentGroup,
+  type HatApplyOutcome,
+  type HatClipEnvelope,
+  type HatSourceData,
+} from './src/hat-interplay-apply';
 import { SamplePackCTACard, type SamplePackCardInfo } from '@signalsandsorcery/plugin-sdk';
 
 type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
@@ -57,6 +73,15 @@ const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
 const EMPTY_PLACEHOLDERS: BulkAddPlaceholderTrack[] = [];
 const DRUM_ACCENT_COLOR = '#FB923C';
+
+/** Clip envelope for hat-interplay writes, derived from the scene's context. */
+function hatEnvelope(mc: MusicalContext): HatClipEnvelope {
+  return {
+    endTimeSeconds: panelClipEndSeconds(mc),
+    tempo: mc.bpm,
+    clipLengthBeats: mc.bars * panelQuarterNotesPerBar(mc),
+  };
+}
 
 interface DrumTrackState {
   handle: PluginTrackHandle;
@@ -166,6 +191,13 @@ export function DrumGeneratorPanel({
   const [availableInstruments, setAvailableInstruments] = useState<InstrumentDescriptor[]>([]);
   const [instrumentsLoading, setInstrumentsLoading] = useState(false);
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
+  // Hat interplay: role by engine id (stable callbacks branch on articulation
+  // without widening dependency arrays), a serialization chain so overlapping
+  // triggers (debounced edit + generate) never interleave group writes, and a
+  // ref handle so loadTracks (declared earlier) can trigger the reconcile.
+  const roleByEngineIdRef = useRef<Map<string, string>>(new Map());
+  const hatChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const runHatInterplayRef = useRef<((mc?: MusicalContext) => Promise<HatApplyOutcome | null>) | null>(null);
   // Phase 1.1 (sample pack distribution): the resolver is fed the live
   // sample-pack root. When the pack is missing or stale, getSamplePackRoot
   // returns null and we render the CTA card instead of the normal panel.
@@ -506,6 +538,25 @@ export function DrumGeneratorPanel({
         setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
         setFadesMeta(parseFades(sceneData));
       }
+      // Hat-interplay reconcile: only for scenes the feature already manages
+      // (a stored group signature exists). If membership changed while the
+      // panel wasn't looking (agent role change / track delete), re-resolve so
+      // suppressed hits restore and sampler openEnded flags follow the current
+      // roles. Scenes without a signature are left completely untouched.
+      if (tracksLoadedForSceneRef.current === sceneAtStart) {
+        const storedSig = sceneData[HAT_GROUP_SIG_KEY];
+        if (typeof storedSig === 'string' && storedSig.length > 0) {
+          const currentSig = computeHatGroupSig(
+            trackStates.flatMap(ts => {
+              const articulation = hatArticulationForRole(ts.role);
+              return articulation ? [{ handle: ts.handle, articulation }] : [];
+            }),
+          );
+          if (currentSig !== storedSig) {
+            void runHatInterplayRef.current?.();
+          }
+        }
+      }
     } catch (error: unknown) {
       console.error('[DrumGeneratorPanel] Failed to load tracks:', error);
     } finally {
@@ -521,9 +572,60 @@ export function DrumGeneratorPanel({
 
   useEffect(() => {
     const map = new Map<string, string>();
-    for (const t of tracks) { map.set(t.handle.id, t.handle.dbId); }
+    const roles = new Map<string, string>();
+    for (const t of tracks) {
+      map.set(t.handle.id, t.handle.dbId);
+      roles.set(t.handle.id, t.role);
+    }
     engineToDbIdRef.current = map;
+    roleByEngineIdRef.current = roles;
   }, [tracks]);
+
+  // --- Hat interplay ------------------------------------------------------
+  // Resolve the scene's hat group (open/closed = one physical hi-hat) and
+  // rewrite changed member clips, then mirror the resolved projection into
+  // panel state so the piano roll shows exactly what plays. Serialized on
+  // hatChainRef; skipped in transition scenes (crossfade/fade layers manage
+  // their own duplicated patterns).
+  const isTransitionScene = sceneContext?.sceneType === 'transition';
+  const runHatInterplay = useCallback(
+    (mcArg?: MusicalContext): Promise<HatApplyOutcome | null> => {
+      const sceneId = activeSceneId;
+      if (!sceneId || isTransitionScene) return Promise.resolve(null);
+      const run = async (): Promise<HatApplyOutcome | null> => {
+        try {
+          const mc = mcArg ?? (await host.getMusicalContext());
+          const outcome = await applyHatInterplay(host, sceneId, hatEnvelope(mc));
+          if (outcome.members.length === 0) return outcome;
+          for (const member of outcome.members) {
+            editLoadStartedRef.current.add(member.trackId);
+          }
+          setTracks(prev => prev.map(t => {
+            const member = outcome.members.find(m => m.trackId === t.handle.id);
+            if (!member) return t;
+            return {
+              ...t,
+              editNotes: member.notes,
+              editBars: mc.bars,
+              editBpm: mc.bpm,
+              editBeatsPerBar: panelQuarterNotesPerBar(mc),
+            };
+          }));
+          return outcome;
+        } catch (err: unknown) {
+          console.warn('[DrumGeneratorPanel] Hat interplay failed:', err);
+          return null;
+        }
+      };
+      const chained = hatChainRef.current.then(run, run);
+      hatChainRef.current = chained;
+      return chained;
+    },
+    [host, activeSceneId, isTransitionScene],
+  );
+  useEffect(() => {
+    runHatInterplayRef.current = runHatInterplay;
+  }, [runHatInterplay]);
 
   // --- Reload tracks incrementally as individual bulk tracks complete ----
   const loadedCompletedIdsRef = useRef<Set<string>>(new Set());
@@ -1166,6 +1268,7 @@ export function DrumGeneratorPanel({
   // --- Delete track -----------------------------------------------------
   const handleDeleteTrack = useCallback(async (trackId: string): Promise<void> => {
     try {
+      const wasHat = hatArticulationForRole(roleByEngineIdRef.current.get(trackId)) !== null;
       await host.deleteTrack(trackId);
       const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       if (activeSceneId) {
@@ -1173,13 +1276,17 @@ export function DrumGeneratorPanel({
         // Drop any legacy subRole row left over from pre-Phase 0.8 tracks.
         await host.deleteSceneData(activeSceneId, `track:${dbId}:subRole`).catch(() => {});
         await host.deleteSceneData(activeSceneId, `track:${dbId}:samplePath`);
+        // Hat interplay: drop the authored source, then re-resolve — deleting
+        // an open-hat track is what RESTORES the closed hits it suppressed.
+        await host.deleteSceneData(activeSceneId, `track:${dbId}:hatSource`).catch(() => {});
       }
       setTracks(prev => prev.filter(t => t.handle.id !== trackId));
+      if (wasHat) void runHatInterplay();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       host.showToast('error', 'Failed to delete track', msg);
     }
-  }, [host, activeSceneId]);
+  }, [host, activeSceneId, runHatInterplay]);
 
   // --- Crossfade group controls -----------------------------------------
   // Mute/solo act on BOTH layers together; per-layer volume/pan reuse the normal
@@ -1410,6 +1517,28 @@ export function DrumGeneratorPanel({
         }
       }
 
+      // Hat interplay: a hat generation writes this track's AUTHORED source and
+      // re-resolves the whole group — an open pattern suppresses colliding
+      // closed hits, open ring lengths are computed to the next hat hit.
+      // Sibling rows sync inside runHatInterplay; THIS row's editor seeds from
+      // its own resolved projection. Regenerating never mutates sibling
+      // sources, so repeated generations accumulate no loss.
+      let displayNotes = processedNotes;
+      const wasHat = hatArticulationForRole(track.role) !== null;
+      const isHat = hatArticulationForRole(newRole) !== null;
+      if (activeSceneId && !isTransitionScene && (isHat || wasHat)) {
+        if (isHat) {
+          const source: HatSourceData = { version: 1, notes: processedNotes, updatedAt: Date.now() };
+          await host.setSceneData(activeSceneId, hatSourceKey(genDbId), source).catch(() => {});
+        } else {
+          // Re-roled away from hats — drop the stale authored source.
+          await host.deleteSceneData(activeSceneId, hatSourceKey(genDbId)).catch(() => {});
+        }
+        const outcome = await runHatInterplay(musicalContext);
+        const mine = outcome?.members.find(m => m.trackId === trackId);
+        if (mine) displayNotes = mine.notes;
+      }
+
       // Generate begins a fresh shuffle cycle — seed the history with the
       // sample we just picked so the next shuffle won't return the same one.
       const freshHistory = newSamplePath ? new Set<string>([newSamplePath]) : new Set<string>();
@@ -1420,9 +1549,10 @@ export function DrumGeneratorPanel({
               ...t, isGenerating: false, error: null, role: newRole, samplePath: newSamplePath,
               hasMidi: true, generationProgress: 0, shuffleHistory: freshHistory,
               // Seed the piano-roll's editable copy from the just-generated notes
-              // (flattened to pitch 60 like all drum MIDI). The Edit tab opens with
-              // no round-trip and won't clobber these.
-              editNotes: processedNotes, editBars: musicalContext.bars, editBpm: musicalContext.bpm,
+              // (flattened to pitch 60 like all drum MIDI; hat tracks show their
+              // interplay-RESOLVED projection). The Edit tab opens with no
+              // round-trip and won't clobber these.
+              editNotes: displayNotes, editBars: musicalContext.bars, editBpm: musicalContext.bpm,
               editBeatsPerBar: panelQuarterNotesPerBar(musicalContext),
             }
           : t
@@ -1441,7 +1571,7 @@ export function DrumGeneratorPanel({
       ));
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver, soundHistory]);
+  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver, soundHistory, isTransitionScene, runHatInterplay]);
 
   // --- Mute/Solo/Volume/Pan -----------------------------------------------
   const handleMuteToggle = useCallback((trackId: string): void => {
@@ -1547,13 +1677,27 @@ export function DrumGeneratorPanel({
   const handleCopy = useCallback(async (trackId: string): Promise<void> => {
     try {
       const newHandle = await host.duplicateTrack(trackId);
+      // Hat interplay: a duplicated hat track's clip holds the RESOLVED
+      // projection — copy the authored source too (else the duplicate's lazy
+      // capture would adopt the projection as its pattern), then re-resolve.
+      const srcDbId = engineToDbIdRef.current.get(trackId);
+      const isHat = hatArticulationForRole(roleByEngineIdRef.current.get(trackId)) !== null;
+      if (activeSceneId && srcDbId && isHat) {
+        const source = await host
+          .getSceneData<HatSourceData>(activeSceneId, hatSourceKey(srcDbId))
+          .catch(() => null);
+        if (source) {
+          await host.setSceneData(activeSceneId, hatSourceKey(newHandle.dbId), source).catch(() => {});
+        }
+      }
       await loadTracks();
+      if (isHat) void runHatInterplay();
       host.showToast('success', 'Track duplicated', newHandle.name);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Copy failed';
       host.showToast('error', 'Copy failed', msg);
     }
-  }, [host, loadTracks]);
+  }, [host, activeSceneId, loadTracks, runHatInterplay]);
 
   // --- FX Operations ----------------------------------------------------
   const handleFxToggle = useCallback((trackId: string, category: FxCategory, enabled: boolean): void => {
@@ -1651,6 +1795,25 @@ export function DrumGeneratorPanel({
     saveTimeoutRefs.current[key] = setTimeout(() => {
       void (async (): Promise<void> => {
         try {
+          // Hat tracks: the editor was showing the RESOLVED projection. Land
+          // the edit on the authored SOURCE (suppressed hits stay safe — a
+          // clear-all here never deletes them), then re-resolve the group.
+          // The rows sync from the resolution, so a closed hit drawn onto an
+          // open hat's step visibly yields right after the debounce.
+          const sceneId = activeSceneId;
+          const isHat = hatArticulationForRole(roleByEngineIdRef.current.get(trackId)) !== null;
+          if (sceneId && !isTransitionScene && isHat) {
+            const mc = await host.getMusicalContext();
+            const group = await resolveCurrentGroup(host, sceneId, hatEnvelope(mc));
+            const member = group.find(m => m.handle.id === trackId);
+            if (member) {
+              const merged = mergeResolvedEditIntoSource(member.resolution.notes, notes, member.sourceNotes);
+              const source: HatSourceData = { version: 1, notes: merged.nextSource, updatedAt: Date.now() };
+              await host.setSceneData(sceneId, hatSourceKey(member.handle.dbId), source);
+              await runHatInterplay(mc);
+              return;
+            }
+          }
           if (notes.length === 0) {
             await host.clearMidi(trackId);
           } else {
@@ -1668,7 +1831,7 @@ export function DrumGeneratorPanel({
         }
       })();
     }, 300);
-  }, [host]);
+  }, [host, activeSceneId, isTransitionScene, runHatInterplay]);
 
   // Tab-strip clicks: switch the active tab, keeping the drawer open.
   const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {

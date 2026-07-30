@@ -29,6 +29,39 @@ export { buildDrumSystemPrompt } from './src/drum-system-prompt';
 export { createKitResolver } from './src/kit-resolver';
 export { parseLLMDrumResponse } from './src/parse-llm-response';
 
+// Hat interplay — open/closed hats act as one physical hi-hat. Same
+// shared-module pattern: the panel and the agent skill handler both call
+// applyHatInterplay after any hat-affecting change.
+export {
+  HAT_ROLE_ARTICULATION,
+  HAT_ARTICULATION_RANK,
+  HAT_COLLISION_EPSILON_BEATS,
+  hatArticulationForRole,
+  resolveHatInterplay,
+} from './src/hat-interplay';
+export type {
+  HatArticulation,
+  HatTrackSource,
+  ResolvedHatNote,
+  HatTrackResolution,
+} from './src/hat-interplay';
+export { mergeResolvedEditIntoSource } from './src/hat-edit-merge';
+export type { HatEditMergeResult } from './src/hat-edit-merge';
+export {
+  HAT_GROUP_SIG_KEY,
+  hatSourceKey,
+  computeHatGroupSig,
+  resolveCurrentGroup,
+  applyHatInterplay,
+} from './src/hat-interplay-apply';
+export type {
+  HatSourceData,
+  HatClipEnvelope,
+  HatGroupMember,
+  HatApplyMemberOutcome,
+  HatApplyOutcome,
+} from './src/hat-interplay-apply';
+
 export class DrumGeneratorPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/drum-generator';
   readonly displayName = 'Drums';
