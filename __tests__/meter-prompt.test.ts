@@ -4,7 +4,8 @@
  * BYTE-IDENTITY PIN: the snapshot pins the canonical 4/4 prompt — with the
  * meter parameter omitted OR passed explicitly as '4/4' — byte-for-byte.
  * Originally recorded from the PRE-meter implementation; last deliberately
- * revised for the hat-interplay style bullet (2026-07-29, hand-edited snap).
+ * revised for the drum-interplay style bullets — one-drummer, tom voice,
+ * one riding hand, interlock (2026-07-29, hand-edited snap).
  * Never `--ci`-update this snapshot as part of a METER change; a diff here
  * means 4/4 behavior drifted. Any intentional prompt revision must hand-edit
  * the snap and update this note.

@@ -88,5 +88,9 @@ ${barCountLine}
 ${rhythmIdiomLines}
 - Vary velocity to create groove — never use a constant velocity for an entire pattern.
 - Keep one track focused on one role — don't try to fit kick AND snare on the same track.
-- Hi-hat interplay: "hat-open" and "hat-closed" tracks act as ONE physical hi-hat. The plugin automatically removes a closed hit that lands on an open hit's step and chokes each open ring at the next hat hit — place open hats exactly where the groove wants them (even on top of an existing closed pattern), and don't shorten hat-open durations to dodge collisions; ring length is computed for you.${meterRulesBlock}`;
+- Hi-hat interplay: "hat-open" and "hat-closed" tracks act as ONE physical hi-hat. The plugin automatically removes a closed hit that lands on an open hit's step and chokes each open ring at the next hat hit — place open hats exactly where the groove wants them (even on top of an existing closed pattern), and don't shorten hat-open durations to dodge collisions; ring length is computed for you.
+- One drummer, one kit: every drum layer in this scene is played by the SAME imaginary drummer — two hands, two feet. Never write a hit that needs more than TWO stick-struck pieces (snares, toms, hats, cymbals) sounding at the same instant; the kick is foot-played and exempt.
+- Tom voice: "tom-hi", "tom-mid", and "tom-low" are ONE melodic voice distributed across three drums. When other tom layers are listed in the context, write INTO their gaps so the combined line reads as a single fill — sequential motion, conventionally descending (hi → mid → low). Two toms may land together only as an isolated accent, never as sustained parallel streams.
+- One riding hand: only one continuous timekeeping voice at a time. If a hat or ride line already carries steady 8ths/16ths, don't add a second riding line — and thin or drop timekeeping where the toms are busy.
+- Interlock into gaps: place your hits in the silences of the drum layers already listed. Double an existing drum layer's onset only on a structural accent (downbeat, backbeat, section start) — never for the whole pattern.${meterRulesBlock}`;
 }

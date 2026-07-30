@@ -25,6 +25,7 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
+import { buildDrumUserPrompt } from './src/drum-user-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
 // — the previous hardcoded role-mapping.ts has been retired (kept only as a
 // tombstone module). The drum panel fetches the live role list at mount and
@@ -37,6 +38,19 @@ import { parseLLMDrumResponse } from './src/parse-llm-response';
 // projection recomputed on every hat-affecting change (see src/hat-interplay).
 import { hatArticulationForRole } from './src/hat-interplay';
 import { mergeResolvedEditIntoSource } from './src/hat-edit-merge';
+// Tom interplay: tom-hi/mid/low are one drummer's two hands — over-limit
+// same-instant collisions suppress (lossless source/projection, mirroring
+// the hat modules; see src/tom-interplay).
+import { normalizeTomRole, tomDepthForRole } from './src/tom-interplay';
+import {
+  TOM_GROUP_SIG_KEY,
+  applyTomInterplay,
+  computeTomGroupSig,
+  resolveCurrentTomGroup,
+  tomSourceKey,
+  type TomApplyOutcome,
+  type TomSourceData,
+} from './src/tom-interplay-apply';
 import {
   HAT_GROUP_SIG_KEY,
   applyHatInterplay,
@@ -198,6 +212,10 @@ export function DrumGeneratorPanel({
   const roleByEngineIdRef = useRef<Map<string, string>>(new Map());
   const hatChainRef = useRef<Promise<unknown>>(Promise.resolve());
   const runHatInterplayRef = useRef<((mc?: MusicalContext) => Promise<HatApplyOutcome | null>) | null>(null);
+  // Independent serialization chain for the tom pass — the two groups touch
+  // disjoint track sets, so their applies can't conflict.
+  const tomChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const runTomInterplayRef = useRef<((mc?: MusicalContext) => Promise<TomApplyOutcome | null>) | null>(null);
   // Phase 1.1 (sample pack distribution): the resolver is fed the live
   // sample-pack root. When the pack is missing or stale, getSamplePackRoot
   // returns null and we render the CTA card instead of the normal panel.
@@ -556,6 +574,20 @@ export function DrumGeneratorPanel({
             void runHatInterplayRef.current?.();
           }
         }
+        // Tom-interplay reconcile — same contract as the hat check above:
+        // only scenes the feature already manages (stored signature exists).
+        const storedTomSig = sceneData[TOM_GROUP_SIG_KEY];
+        if (typeof storedTomSig === 'string' && storedTomSig.length > 0) {
+          const currentTomSig = computeTomGroupSig(
+            trackStates.flatMap(ts => {
+              const tomRole = normalizeTomRole(ts.role);
+              return tomRole ? [{ handle: ts.handle, role: tomRole }] : [];
+            }),
+          );
+          if (currentTomSig !== storedTomSig) {
+            void runTomInterplayRef.current?.();
+          }
+        }
       }
     } catch (error: unknown) {
       console.error('[DrumGeneratorPanel] Failed to load tracks:', error);
@@ -626,6 +658,50 @@ export function DrumGeneratorPanel({
   useEffect(() => {
     runHatInterplayRef.current = runHatInterplay;
   }, [runHatInterplay]);
+
+  // --- Tom interplay ------------------------------------------------------
+  // Same shape as runHatInterplay: resolve the scene's tom group (over-limit
+  // same-instant collisions suppress, max two toms = two hands), rewrite
+  // changed member clips, and mirror the resolved projection into panel
+  // state. Serialized on its own chain; skipped in transition scenes.
+  const runTomInterplay = useCallback(
+    (mcArg?: MusicalContext): Promise<TomApplyOutcome | null> => {
+      const sceneId = activeSceneId;
+      if (!sceneId || isTransitionScene) return Promise.resolve(null);
+      const run = async (): Promise<TomApplyOutcome | null> => {
+        try {
+          const mc = mcArg ?? (await host.getMusicalContext());
+          const outcome = await applyTomInterplay(host, sceneId, hatEnvelope(mc));
+          if (outcome.members.length === 0) return outcome;
+          for (const member of outcome.members) {
+            editLoadStartedRef.current.add(member.trackId);
+          }
+          setTracks(prev => prev.map(t => {
+            const member = outcome.members.find(m => m.trackId === t.handle.id);
+            if (!member) return t;
+            return {
+              ...t,
+              editNotes: member.notes,
+              editBars: mc.bars,
+              editBpm: mc.bpm,
+              editBeatsPerBar: panelQuarterNotesPerBar(mc),
+            };
+          }));
+          return outcome;
+        } catch (err: unknown) {
+          console.warn('[DrumGeneratorPanel] Tom interplay failed:', err);
+          return null;
+        }
+      };
+      const chained = tomChainRef.current.then(run, run);
+      tomChainRef.current = chained;
+      return chained;
+    },
+    [host, activeSceneId, isTransitionScene],
+  );
+  useEffect(() => {
+    runTomInterplayRef.current = runTomInterplay;
+  }, [runTomInterplay]);
 
   // --- Reload tracks incrementally as individual bulk tracks complete ----
   const loadedCompletedIdsRef = useRef<Set<string>>(new Set());
@@ -1269,6 +1345,7 @@ export function DrumGeneratorPanel({
   const handleDeleteTrack = useCallback(async (trackId: string): Promise<void> => {
     try {
       const wasHat = hatArticulationForRole(roleByEngineIdRef.current.get(trackId)) !== null;
+      const wasTom = tomDepthForRole(roleByEngineIdRef.current.get(trackId)) !== null;
       await host.deleteTrack(trackId);
       const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       if (activeSceneId) {
@@ -1279,14 +1356,17 @@ export function DrumGeneratorPanel({
         // Hat interplay: drop the authored source, then re-resolve — deleting
         // an open-hat track is what RESTORES the closed hits it suppressed.
         await host.deleteSceneData(activeSceneId, `track:${dbId}:hatSource`).catch(() => {});
+        // Tom interplay: same restore-on-delete contract as hats.
+        await host.deleteSceneData(activeSceneId, `track:${dbId}:tomSource`).catch(() => {});
       }
       setTracks(prev => prev.filter(t => t.handle.id !== trackId));
       if (wasHat) void runHatInterplay();
+      if (wasTom) void runTomInterplay();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       host.showToast('error', 'Failed to delete track', msg);
     }
-  }, [host, activeSceneId, runHatInterplay]);
+  }, [host, activeSceneId, runHatInterplay, runTomInterplay]);
 
   // --- Crossfade group controls -----------------------------------------
   // Mute/solo act on BOTH layers together; per-layer volume/pan reuse the normal
@@ -1412,23 +1492,33 @@ export function DrumGeneratorPanel({
 
     try {
       const musicalContext = await host.getMusicalContext();
-      const generationContext = await host.getGenerationContext(trackId);
+      // Pin every sibling drum layer as a budget-exempt REFERENCE track.
+      // The generation-context budget drops whole low-priority drum tracks
+      // first in busy scenes — exactly the siblings (e.g. the other toms)
+      // this pattern must interlock with. Panel tracks ARE the drum family,
+      // so pinning them all is precise, and drum clips are small (tens of
+      // notes against the 1000-note budget).
+      const pinTrackDbIds = tracks
+        .filter(t => t.handle.id !== trackId && t.hasMidi)
+        .map(t => engineToDbIdRef.current.get(t.handle.id) ?? t.handle.id);
+      const generationContext = await host.getGenerationContext(
+        trackId,
+        pinTrackDbIds.length > 0 ? { pinTrackDbIds } : undefined,
+      );
 
       // formatConcurrentTracks returns '' when no other tracks exist —
       // skip the heading entirely in that case rather than emitting
       // "(none yet)" noise into every solo-track generation.
       const concurrentBlock = formatConcurrentTracks(generationContext);
 
-      const promptParts: string[] = [];
-      if (concurrentBlock) {
-        promptParts.push(concurrentBlock, '');
-      }
-      promptParts.push(
-        `User request: "${track.prompt}"`,
-        ``,
-        `Generate a drum-pattern MIDI clip that fits this context.`,
-      );
-      const userPrompt = promptParts.join('\n');
+      // Regenerate knows the track's kit role and states it (the interplay
+      // rules only bite when the model knows which layer it is writing);
+      // a fresh track leaves the role as the LLM's choice.
+      const userPrompt = buildDrumUserPrompt({
+        concurrentBlock,
+        userRequest: track.prompt,
+        targetRole: track.role || null,
+      });
 
       const llmResult = await host.generateWithLLM({
         // Phase 0.8: roles are FS-discovered now. Pass the live list so the
@@ -1539,6 +1629,25 @@ export function DrumGeneratorPanel({
         if (mine) displayNotes = mine.notes;
       }
 
+      // Tom interplay — same source/projection contract as the hat block. A
+      // track has exactly one role, so at most one of the two blocks adopts
+      // this row's resolved notes; a cross-group re-role (hat→tom or tom→hat)
+      // fires both blocks and each cleans/persists its own source key.
+      const wasTom = tomDepthForRole(track.role) !== null;
+      const isTom = tomDepthForRole(newRole) !== null;
+      if (activeSceneId && !isTransitionScene && (isTom || wasTom)) {
+        if (isTom) {
+          const source: TomSourceData = { version: 1, notes: processedNotes, updatedAt: Date.now() };
+          await host.setSceneData(activeSceneId, tomSourceKey(genDbId), source).catch(() => {});
+        } else {
+          // Re-roled away from toms — drop the stale authored source.
+          await host.deleteSceneData(activeSceneId, tomSourceKey(genDbId)).catch(() => {});
+        }
+        const tomOutcome = await runTomInterplay(musicalContext);
+        const mineTom = tomOutcome?.members.find(m => m.trackId === trackId);
+        if (mineTom) displayNotes = mineTom.notes;
+      }
+
       // Generate begins a fresh shuffle cycle — seed the history with the
       // sample we just picked so the next shuffle won't return the same one.
       const freshHistory = newSamplePath ? new Set<string>([newSamplePath]) : new Set<string>();
@@ -1571,7 +1680,7 @@ export function DrumGeneratorPanel({
       ));
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver, soundHistory, isTransitionScene, runHatInterplay]);
+  }, [host, tracks, isAuthenticated, activeSceneId, availableRoles, kitResolver, soundHistory, isTransitionScene, runHatInterplay, runTomInterplay]);
 
   // --- Mute/Solo/Volume/Pan -----------------------------------------------
   const handleMuteToggle = useCallback((trackId: string): void => {
@@ -1690,14 +1799,27 @@ export function DrumGeneratorPanel({
           await host.setSceneData(activeSceneId, hatSourceKey(newHandle.dbId), source).catch(() => {});
         }
       }
+      // Tom interplay: same copy-the-source contract — the duplicate's clip
+      // holds the resolved projection, so without this the lazy capture would
+      // adopt the projection (minus suppressed hits) as its authored pattern.
+      const isTom = tomDepthForRole(roleByEngineIdRef.current.get(trackId)) !== null;
+      if (activeSceneId && srcDbId && isTom) {
+        const source = await host
+          .getSceneData<TomSourceData>(activeSceneId, tomSourceKey(srcDbId))
+          .catch(() => null);
+        if (source) {
+          await host.setSceneData(activeSceneId, tomSourceKey(newHandle.dbId), source).catch(() => {});
+        }
+      }
       await loadTracks();
       if (isHat) void runHatInterplay();
+      if (isTom) void runTomInterplay();
       host.showToast('success', 'Track duplicated', newHandle.name);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Copy failed';
       host.showToast('error', 'Copy failed', msg);
     }
-  }, [host, activeSceneId, loadTracks, runHatInterplay]);
+  }, [host, activeSceneId, loadTracks, runHatInterplay, runTomInterplay]);
 
   // --- FX Operations ----------------------------------------------------
   const handleFxToggle = useCallback((trackId: string, category: FxCategory, enabled: boolean): void => {
@@ -1814,6 +1936,22 @@ export function DrumGeneratorPanel({
               return;
             }
           }
+          // Tom tracks: same edit-on-the-source contract as hats — the merge
+          // helper is articulation-agnostic (matches on startBeat, pitch is
+          // always 60), so suppressed tom hits survive a clear-all too.
+          const isTom = tomDepthForRole(roleByEngineIdRef.current.get(trackId)) !== null;
+          if (sceneId && !isTransitionScene && isTom) {
+            const mc = await host.getMusicalContext();
+            const group = await resolveCurrentTomGroup(host, sceneId, hatEnvelope(mc));
+            const member = group.find(m => m.handle.id === trackId);
+            if (member) {
+              const merged = mergeResolvedEditIntoSource(member.resolution.notes, notes, member.sourceNotes);
+              const source: TomSourceData = { version: 1, notes: merged.nextSource, updatedAt: Date.now() };
+              await host.setSceneData(sceneId, tomSourceKey(member.handle.dbId), source);
+              await runTomInterplay(mc);
+              return;
+            }
+          }
           if (notes.length === 0) {
             await host.clearMidi(trackId);
           } else {
@@ -1831,7 +1969,7 @@ export function DrumGeneratorPanel({
         }
       })();
     }, 300);
-  }, [host, activeSceneId, isTransitionScene, runHatInterplay]);
+  }, [host, activeSceneId, isTransitionScene, runHatInterplay, runTomInterplay]);
 
   // Tab-strip clicks: switch the active tab, keeping the drawer open.
   const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {

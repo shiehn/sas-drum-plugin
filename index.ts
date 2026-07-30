@@ -26,6 +26,8 @@ export { drumManifest };
 // (plugin-skill-handlers) can drive the `generate_drums` skill without reaching
 // into the plugin's internals. These are the same modules the panel uses.
 export { buildDrumSystemPrompt } from './src/drum-system-prompt';
+export { buildDrumUserPrompt } from './src/drum-user-prompt';
+export type { DrumUserPromptOptions } from './src/drum-user-prompt';
 export { createKitResolver } from './src/kit-resolver';
 export { parseLLMDrumResponse } from './src/parse-llm-response';
 
@@ -61,6 +63,39 @@ export type {
   HatApplyMemberOutcome,
   HatApplyOutcome,
 } from './src/hat-interplay-apply';
+
+// Tom interplay — tom-hi/mid/low are one drummer's two hands: over-limit
+// same-instant collisions suppress (max two simultaneous toms). Same shared
+// source/projection contract as hats; deliberately duplicated modules (see
+// src/tom-interplay.ts header).
+export {
+  TOM_ROLE_DEPTH,
+  MAX_SIMULTANEOUS_TOMS,
+  TOM_COLLISION_EPSILON_BEATS,
+  normalizeTomRole,
+  tomDepthForRole,
+  resolveTomInterplay,
+} from './src/tom-interplay';
+export type {
+  TomRole,
+  TomTrackSource,
+  ResolvedTomNote,
+  TomTrackResolution,
+} from './src/tom-interplay';
+export {
+  TOM_GROUP_SIG_KEY,
+  tomSourceKey,
+  computeTomGroupSig,
+  resolveCurrentTomGroup,
+  applyTomInterplay,
+} from './src/tom-interplay-apply';
+export type {
+  TomSourceData,
+  TomClipEnvelope,
+  TomGroupMember,
+  TomApplyMemberOutcome,
+  TomApplyOutcome,
+} from './src/tom-interplay-apply';
 
 export class DrumGeneratorPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/drum-generator';
