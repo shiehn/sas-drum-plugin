@@ -85,6 +85,7 @@ Rules:
 Style guidance:
 ${barCountLine}
 - If "Concurrent tracks in scene" or "REFERENCE TRACKS" are listed, interlock with them: line the kick up with (or deliberately around) the bassline's root hits, keep snare/hat accents out of the way of busy melodic syncopation, and leave space where the arrangement is already dense.
+- If "RHYTHM ANCHORS" are listed, they are the low-end parts the whole band locks to: put kick hits ON their onsets rather than dodging them. Anti-doubling advice applies to melodic REFERENCE TRACKS, never to the anchors.
 ${rhythmIdiomLines}
 - Vary velocity to create groove — never use a constant velocity for an entire pattern.
 - Keep one track focused on one role — don't try to fit kick AND snare on the same track.

@@ -4,8 +4,10 @@
  * BYTE-IDENTITY PIN: the snapshot pins the canonical 4/4 prompt — with the
  * meter parameter omitted OR passed explicitly as '4/4' — byte-for-byte.
  * Originally recorded from the PRE-meter implementation; last deliberately
- * revised for the drum-interplay style bullets — one-drummer, tom voice,
- * one riding hand, interlock (2026-07-29, hand-edited snap).
+ * revised 2026-08-10 (hand-edited snap) to add the RHYTHM ANCHORS bullet —
+ * the kick/sub pins now render under their own lock-to header instead of the
+ * counterpoint one. Revision before that: the drum-interplay style bullets —
+ * one-drummer, tom voice, one riding hand, interlock (2026-07-29).
  * Never `--ci`-update this snapshot as part of a METER change; a diff here
  * means 4/4 behavior drifted. Any intentional prompt revision must hand-edit
  * the snap and update this note.
