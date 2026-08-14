@@ -18,7 +18,7 @@
     "dev": "tsup --watch",
     "test": "jest",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\""
   },
   "devDependencies": {
     "@signalsandsorcery/plugin-sdk": "file:../sas-plugin-sdk",

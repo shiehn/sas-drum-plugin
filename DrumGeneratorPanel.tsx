@@ -1183,7 +1183,9 @@ export function DrumGeneratorPanel({
         defaultName: 'drum-tracks',
       });
       if (result.success) {
-        const filename = result.filePath.split('/').pop() || result.filePath;
+        // Both separators — the save-dialog path is native (backslashes on
+        // Windows), unlike the posix-normalized library surfaces.
+        const filename = result.filePath.split(/[\\/]/u).pop() || result.filePath;
         const skippedNote = result.skippedCount > 0
           ? ` (${result.skippedCount} empty track${result.skippedCount === 1 ? '' : 's'} skipped)`
           : '';
