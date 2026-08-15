@@ -13,17 +13,13 @@ import type {
   PluginUIProps,
   PluginTrackHandle,
   PluginTrackRuntimeState,
-  PluginTrackFxDetailState,
-  PluginFxCategoryDetailState,
   MidiClipData,
   MusicalContext,
   PluginMidiNote,
   BulkAddPlaceholderTrack,
   InstrumentDescriptor,
-  FxCategory,
-  TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackRowDragProps, type TrackSoundHistory, SorceryProgressBar, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
 import { buildDrumSystemPrompt } from './src/drum-system-prompt';
 import { buildDrumUserPrompt } from './src/drum-user-prompt';
 // Phase 0.8: role taxonomy is FS-discovered via kitResolver.getDiscoveredRoles()
@@ -114,7 +110,6 @@ interface DrumTrackState {
    */
   shuffleHistory: Set<string>;
   runtimeState: PluginTrackRuntimeState;
-  fxDetailState: TrackFxDetailState;
   // Unified drawer state (replaces fxDrawerOpen + instrumentDrawerOpen + instrumentDrawerStage).
   drawerOpen: boolean;
   drawerTab: DrawerTab;
@@ -446,14 +441,6 @@ export function DrumGeneratorPanel({
           // Use defaults
         }
 
-        let fxDetailState: TrackFxDetailState = { ...EMPTY_FX_DETAIL_STATE };
-        try {
-          const fxState = await host.getTrackFxState(handle.id);
-          fxDetailState = pluginFxToToggleFx(fxState);
-        } catch {
-          // Use defaults
-        }
-
         const promptKey = `track:${handle.dbId}:prompt`;
         const samplePathKey = `track:${handle.dbId}:samplePath`;
 
@@ -503,7 +490,6 @@ export function DrumGeneratorPanel({
           samplePath,
           shuffleHistory: samplePath ? new Set<string>([samplePath]) : new Set<string>(),
           runtimeState,
-          fxDetailState,
           drawerOpen: false,
           drawerTab: 'fx',
           editorStage: false,
@@ -829,7 +815,6 @@ export function DrumGeneratorPanel({
         samplePath: null,
         shuffleHistory: new Set<string>(),
         runtimeState: { id: handle.id, muted: false, solo: false, volume: 0.75, pan: 0 },
-        fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
         drawerOpen: false,
         drawerTab: 'fx',
         editorStage: false,
@@ -1822,64 +1807,15 @@ export function DrumGeneratorPanel({
   }, [host, activeSceneId, loadTracks, runHatInterplay, runTomInterplay]);
 
   // --- FX Operations ----------------------------------------------------
-  const handleFxToggle = useCallback((trackId: string, category: FxCategory, enabled: boolean): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled } } }
-        : t
-    ));
-    host.toggleTrackFx(trackId, category, enabled).catch(() => {
-      setTracks(prev => prev.map(t =>
-        t.handle.id === trackId
-          ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled: !enabled } } }
-          : t
-      ));
-    });
-  }, [host]);
-
-  const handleFxPresetChange = useCallback((trackId: string, category: FxCategory, presetIndex: number): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], presetIndex } } }
-        : t
-    ));
-    host.setTrackFxPreset(trackId, category, presetIndex).then(result => {
-      if (result.dryWet !== undefined) {
-        setTracks(prev => prev.map(t =>
-          t.handle.id === trackId
-            ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: result.dryWet as number } } }
-            : t
-        ));
-      }
-    }).catch(() => {});
-  }, [host]);
-
-  const handleFxDryWetChange = useCallback((trackId: string, category: FxCategory, value: number): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: value } } }
-        : t
-    ));
-    host.setTrackFxDryWet(trackId, category, value).catch(() => {});
-  }, [host]);
-
+  // Built-in Tracktion FX were removed in SDK 3.0.0 — the FX tab now shows
+  // only the 3rd-party section, driven entirely by the externalFxHost prop.
   const toggleFxDrawer = useCallback((trackId: string): void => {
     setTracks(prev => prev.map(t => {
       if (t.handle.id !== trackId) return t;
       const onFx = t.drawerOpen && t.drawerTab === 'fx';
       return { ...t, drawerOpen: !onFx, drawerTab: 'fx', editorStage: false };
     }));
-    const track = tracks.find(t => t.handle.id === trackId);
-    // Refresh FX state from the engine whenever we OPEN the FX tab.
-    const wasOnFx = !!track && track.drawerOpen && track.drawerTab === 'fx';
-    if (track && !wasOnFx) {
-      host.getTrackFxState(trackId).then(fxState => {
-        setTracks(prev => prev.map(t =>
-          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
-        ));
-      }).catch(() => {});
-    }
-  }, [host, tracks]);
+  }, []);
 
   // --- Piano-roll edit (load on first open, debounced save) ---
   // Lazily fetch the track's current MIDI the first time the Edit tab opens.
@@ -1976,17 +1912,11 @@ export function DrumGeneratorPanel({
     setTracks(prev => prev.map(t =>
       t.handle.id === trackId ? { ...t, drawerOpen: true, drawerTab: tab } : t
     ));
-    if (tab === 'fx') {
-      host.getTrackFxState(trackId).then(fxState => {
-        setTracks(prev => prev.map(t =>
-          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
-        ));
-      }).catch(() => {});
-    } else if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
+    if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
       editLoadStartedRef.current.add(trackId);
       void loadEditNotes(trackId);
     }
-  }, [host, loadEditNotes]);
+  }, [loadEditNotes]);
 
   const handleProgressChange = useCallback((trackId: string, pct: number): void => {
     setTracks(prev => prev.map(t =>
@@ -2448,7 +2378,6 @@ export function DrumGeneratorPanel({
           pan: track.runtimeState.pan,
         }}
         soloedOut={anySolo && !track.runtimeState.solo}
-        fxDetailState={track.fxDetailState}
         drawerOpen={track.drawerOpen}
         drawerTab={track.drawerTab}
         onTabChange={(tab) => handleTabChange(track.handle.id, tab)}
@@ -2467,10 +2396,7 @@ export function DrumGeneratorPanel({
         onSoloToggle={() => handleSoloToggle(track.handle.id)}
         onVolumeChange={(vol: number) => handleVolumeChange(track.handle.id, vol)}
         onPanChange={(pan: number) => handlePanChange(track.handle.id, pan)}
-        onFxToggle={(cat: FxCategory, enabled: boolean) => handleFxToggle(track.handle.id, cat, enabled)}
         externalFxHost={host}
-        onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
-        onFxDryWetChange={(cat: FxCategory, val: number) => handleFxDryWetChange(track.handle.id, cat, val)}
         onToggleFxDrawer={() => toggleFxDrawer(track.handle.id)}
         onProgressChange={(pct: number) => handleProgressChange(track.handle.id, pct)}
         accentColor={DRUM_ACCENT_COLOR}
@@ -2501,21 +2427,6 @@ export function DrumGeneratorPanel({
 // ============================================================================
 // Helpers
 // ============================================================================
-
-function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailState {
-  const result = { ...EMPTY_FX_DETAIL_STATE };
-  for (const category of ['eq', 'compressor', 'chorus', 'phaser', 'delay', 'reverb'] as const) {
-    const sdkCat = sdkState[category] as PluginFxCategoryDetailState | undefined;
-    if (sdkCat) {
-      result[category] = {
-        enabled: sdkCat.enabled,
-        presetIndex: sdkCat.presetIndex,
-        dryWet: sdkCat.dryWet,
-      };
-    }
-  }
-  return result;
-}
 
 /** Pretty filename for display in the TrackRow ("kick-12345.wav" → "kick 12345"). */
 function sampleNameForDisplay(samplePath: string): string {
