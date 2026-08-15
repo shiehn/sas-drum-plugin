@@ -173,7 +173,6 @@ export function DrumGeneratorPanel({
   const [tracks, setTracks] = useState<DrumTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [soundImportTarget, setSoundImportTarget] = useState<DrumTrackState | null>(null);
   // Transition Designer (transition scenes): the single board replacing the
   // per-pair "+ Crossfade"/"+ Fade" modals, plus parsed pair metadata for the
   // active scene (members are normal tracks linked via scene-data).
@@ -271,14 +270,17 @@ export function DrumGeneratorPanel({
     getId: (t) => t.handle.dbId,
   });
 
-  // Import just the SAMPLE from a track in another scene (drawer "Import
-  // Sample"), bypassing the contract gate. The picker hands back the source
-  // track; we read its sound via host.getTrackSound, then apply + record it so
-  // it's undoable and persisted like a shuffle.
-  const handleSoundImportPick = useCallback(
-    async (sel: { sourceTrackDbId: string; trackName: string; sceneName: string }): Promise<void> => {
-      const target = soundImportTarget;
-      if (!target || !host.getTrackSound) { setSoundImportTarget(null); return; }
+  // Import just the SAMPLE from a track in another scene (the drawer's Import
+  // tab), bypassing the contract gate. The browser hands back the source track;
+  // we read its sound via host.getTrackSound, then apply + record it so it's
+  // undoable and persisted like a shuffle. The destination arrives as an
+  // argument — the browser lives in the row that owns it (SDK 3.1.0).
+  const handleSoundImportPickFor = useCallback(
+    async (
+      target: DrumTrackState,
+      sel: { sourceTrackDbId: string; trackName: string; sceneName: string },
+    ): Promise<void> => {
+      if (!host.getTrackSound) return;
       try {
         const snap = await host.getTrackSound(sel.sourceTrackDbId);
         if (!snap || snap.kind !== 'sample') {
@@ -290,11 +292,9 @@ export function DrumGeneratorPanel({
         host.showToast('success', 'Sample imported', `${snap.label} → ${target.handle.name}`);
       } catch (err: unknown) {
         host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
-      } finally {
-        setSoundImportTarget(null);
       }
     },
-    [soundImportTarget, host, applyDrumSound, soundHistory],
+    [host, applyDrumSound, soundHistory],
   );
 
   // Pack-status drives the empty-state vs normal-state branch. Re-evaluated
@@ -2217,18 +2217,9 @@ export function DrumGeneratorPanel({
           testIdPrefix="drums-import"
         />
       )}
-      {host.listImportableTracks && host.getTrackSound && (
-        <ImportTrackModal
-          host={host}
-          mode="sound"
-          open={!!soundImportTarget}
-          title="Import Sample"
-          onClose={() => setSoundImportTarget(null)}
-          onImported={() => {}}
-          onPick={handleSoundImportPick}
-          testIdPrefix="drums-sound-import"
-        />
-      )}
+      {/* No sound-import modal: the drawer's Import tab browses scenes inline
+          (SDK 3.1.0). The whole-track import above keeps its modal — it is
+          launched from the panel header, not from a row. */}
       {canCrossfade && xfFromId && xfToId && (
         <div className={designerView ? 'contents' : 'hidden'}>
           <TransitionDesigner
@@ -2412,7 +2403,7 @@ export function DrumGeneratorPanel({
         soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
         onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
         onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
-        onImportSound={() => setSoundImportTarget(track)}
+        onImportPick={(sel) => handleSoundImportPickFor(track, sel)}
         importSoundLabel="Import Sample"
         editNotes={track.editNotes}
         onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
