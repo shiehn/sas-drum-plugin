@@ -97,6 +97,43 @@ export type {
   TomApplyOutcome,
 } from './src/tom-interplay-apply';
 
+// Drum fills — pre-generated fills that rotate one-per-loop on top of the
+// groove (alt-track UNITS, SDK 3.10.0). Same shared-module contract: the
+// panel and the `drum_fills` skill handler both drive these.
+export {
+  fillKey,
+  isFillMemberMeta,
+  parseFills,
+  fillMemberDbIds,
+  dependentsOfSource,
+} from './src/fills/fill-meta';
+export type { FillMemberMeta, ParsedFill, ParsedFillMember } from './src/fills/fill-meta';
+export { clampToTail } from './src/fills/fill-notes';
+export {
+  MAX_FILL_PARTS,
+  allowedFillLengthBars,
+  buildFillSystemPrompt,
+} from './src/fills/fill-system-prompt';
+export { buildFillUserPrompt, describeFillForPrompt } from './src/fills/fill-user-prompt';
+export type { FillUserPromptOptions } from './src/fills/fill-user-prompt';
+export { parseFillResponse } from './src/fills/parse-fill-response';
+export type { LLMFillResponse, LLMFillPart } from './src/fills/parse-fill-response';
+export {
+  generateAndMaterializeFill,
+  regenerateFill,
+  deleteFill,
+  regroupAllFills,
+  FillGenerationError,
+} from './src/fills/materialize-fills';
+export type {
+  FillSourceTrack,
+  MaterializeFillContext,
+  MaterializedFill,
+  MaterializedFillMember,
+  FillUnitRef,
+} from './src/fills/materialize-fills';
+export { applyFillSoundFollow } from './src/fills/fill-sound-follow';
+
 export class DrumGeneratorPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/drum-generator';
   readonly displayName = 'Drums';
@@ -166,6 +203,38 @@ export class DrumGeneratorPlugin implements GeneratorPlugin {
             },
           },
           required: ['prompt'],
+        },
+      },
+      {
+        id: 'drum_fills',
+        description:
+          'Manage rotating drum FILLS for the active scene: pre-generated fills built from the groove\'s own kit sounds (same samples, mix, FX, and drum bus) that play ON TOP of the groove — exactly ONE fill per loop pass, round-robining each repeat. Use for "add some drum fills", "give the loop variety at the end", "regenerate the second fill as a tom build". action="generate" creates `count` new fills (LLM-composed against the current groove; optional `prompt` steers them); "list" reports the scene\'s fills; "regenerate" replaces one fill\'s pattern (`fill` selector by name or number, optional `prompt`); "remove" deletes one fill. Fills follow the kit automatically when drum samples change. Requires an existing sampled-drum groove (generate_drums) with roles.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['generate', 'list', 'regenerate', 'remove'],
+              description:
+                'generate = create new fills; list = report the fills; regenerate = replace one fill; remove = delete one fill.',
+            },
+            count: {
+              type: 'number',
+              description:
+                'For generate: how many fills to create (1-4, default 3; capped by free track slots).',
+            },
+            prompt: {
+              type: 'string',
+              description:
+                'Optional fill description for generate/regenerate (e.g. "snare roll building into the drop").',
+            },
+            fill: {
+              type: 'string',
+              description:
+                'For regenerate/remove: which fill — its name ("Snare rush") or 1-based number ("2").',
+            },
+          },
+          required: ['action'],
         },
       },
       {

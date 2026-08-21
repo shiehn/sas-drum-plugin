@@ -152,4 +152,25 @@ describe('applyTomInterplay', () => {
     expect(raw.writeMidiClip).not.toHaveBeenCalled();
     expect(raw.clearMidi).not.toHaveBeenCalled();
   });
+
+  it('excludes FILL tracks from the tom group (fills rotate on their own)', async () => {
+    const tomNotes = [note(0), note(1)];
+    const fillNotes = [note(3, 0.15, 110), note(3.25, 0.15, 112), note(3.5, 0.15, 115)];
+    const sceneData = new Map<string, unknown>([
+      ['track:filltom:fill', { version: 1, fillId: 'f1', fillName: 'Tom cascade', fillPrompt: null, unitOrder: 0, role: 'tom-low', sourceTrackDbId: 'low', createdAt: 1 }],
+    ]);
+    const { host, writes } = makeHost(
+      [
+        { handle: handle('low', 'tom-low'), clipNotes: tomNotes },
+        { handle: handle('filltom', 'tom-low'), clipNotes: fillNotes },
+      ],
+      sceneData,
+    );
+
+    await applyTomInterplay(host, SCENE, ENVELOPE);
+
+    expect(sceneData.get(tomSourceKey('filltom'))).toBeUndefined();
+    expect(writes.find(w => w.trackId === 'engine-filltom')).toBeUndefined();
+    expect(sceneData.get(tomSourceKey('low'))).toBeDefined();
+  });
 });

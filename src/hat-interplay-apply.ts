@@ -21,6 +21,7 @@
  */
 
 import type { PluginHost, PluginMidiNote, PluginTrackHandle } from '@signalsandsorcery/plugin-sdk';
+import { fillKey } from './fills/fill-meta';
 import type { HatArticulation, HatTrackResolution, ResolvedHatNote } from './hat-interplay';
 import { hatArticulationForRole, resolveHatInterplay } from './hat-interplay';
 
@@ -135,11 +136,21 @@ export async function resolveCurrentGroup(
   envelope: HatClipEnvelope,
 ): Promise<HatGroupMember[]> {
   const tracks = await host.getPluginTracks();
-  const hatHandles = tracks
+  const roleHandles = tracks
     .map((handle: PluginTrackHandle) => ({ handle, articulation: hatArticulationForRole(handle.role) }))
     .filter((entry): entry is { handle: PluginTrackHandle; articulation: HatArticulation } =>
       entry.articulation !== null,
     );
+  // FILL tracks borrow hat sounds but are NOT part of the physical hi-hat:
+  // they play in the loop tail on their own rotation. Without this filter a
+  // hat fill would be swallowed by open/closed suppression (and would
+  // suppress groove hits in turn).
+  const fillFlags = await Promise.all(
+    roleHandles.map(({ handle }) =>
+      host.getSceneData(sceneId, fillKey(handle.dbId)).catch(() => null),
+    ),
+  );
+  const hatHandles = roleHandles.filter((_, i) => !fillFlags[i]);
   if (hatHandles.length === 0) return [];
 
   const canReadMidi = typeof host.readMidiNotes === 'function';

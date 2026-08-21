@@ -179,4 +179,27 @@ describe('applyHatInterplay', () => {
     expect(outcome.members).toEqual([]);
     expect(sceneData.has(HAT_GROUP_SIG_KEY)).toBe(false);
   });
+
+  it('excludes FILL tracks from the hat group (fills rotate on their own)', async () => {
+    const closedNotes = [note(0), note(0.5), note(1)];
+    const fillNotes = [note(3, 0.15, 110), note(3.5, 0.15, 115)];
+    const sceneData = new Map<string, unknown>([
+      ['track:fillhat:fill', { version: 1, fillId: 'f1', fillName: 'Hat run', fillPrompt: null, unitOrder: 0, role: 'hat-closed', sourceTrackDbId: 'closed', createdAt: 1 }],
+    ]);
+    const { host, writes } = makeHost(
+      [
+        { handle: handle('closed', 'hat-closed'), clipNotes: closedNotes },
+        { handle: handle('fillhat', 'hat-closed'), clipNotes: fillNotes },
+      ],
+      sceneData,
+    );
+
+    await applyHatInterplay(host, SCENE, ENVELOPE);
+
+    // The fill track is not a group member: no lazy source capture, no rewrite.
+    expect(sceneData.get(hatSourceKey('fillhat'))).toBeUndefined();
+    expect(writes.find(w => w.trackId === 'engine-fillhat')).toBeUndefined();
+    // The groove hat still behaves as the (only) member.
+    expect(sceneData.get(hatSourceKey('closed'))).toBeDefined();
+  });
 });

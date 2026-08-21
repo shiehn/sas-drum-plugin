@@ -1,6 +1,6 @@
 {
   "name": "@signalsandsorcery/drum-generator",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "AI-powered drum-pattern MIDI generation with a built-in sample-based drum sampler",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

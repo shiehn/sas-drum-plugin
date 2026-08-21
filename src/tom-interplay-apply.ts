@@ -21,6 +21,7 @@
  */
 
 import type { PluginHost, PluginMidiNote, PluginTrackHandle } from '@signalsandsorcery/plugin-sdk';
+import { fillKey } from './fills/fill-meta';
 import type { HatClipEnvelope } from './hat-interplay-apply';
 import type { TomRole, TomTrackResolution, ResolvedTomNote } from './tom-interplay';
 import { normalizeTomRole, resolveTomInterplay } from './tom-interplay';
@@ -129,9 +130,18 @@ export async function resolveCurrentTomGroup(
   envelope: TomClipEnvelope,
 ): Promise<TomGroupMember[]> {
   const tracks = await host.getPluginTracks();
-  const tomHandles = tracks
+  const roleHandles = tracks
     .map((handle: PluginTrackHandle) => ({ handle, role: normalizeTomRole(handle.role) }))
     .filter((entry): entry is { handle: PluginTrackHandle; role: TomRole } => entry.role !== null);
+  // FILL tracks borrow tom sounds but are NOT the tom voice — see the
+  // matching filter in hat-interplay-apply. Without it a tom fill would hit
+  // the max-two-simultaneous-toms suppression against the groove toms.
+  const fillFlags = await Promise.all(
+    roleHandles.map(({ handle }) =>
+      host.getSceneData(sceneId, fillKey(handle.dbId)).catch(() => null),
+    ),
+  );
+  const tomHandles = roleHandles.filter((_, i) => !fillFlags[i]);
   if (tomHandles.length === 0) return [];
 
   const canReadMidi = typeof host.readMidiNotes === 'function';

@@ -57,6 +57,22 @@ import {
   type HatClipEnvelope,
   type HatSourceData,
 } from './src/hat-interplay-apply';
+// Drum fills: pre-generated fills that rotate ONE per loop pass on top of
+// the groove (alt-track units, SDK 3.10.0). Pure meta/parse + the host
+// orchestrators live in src/fills; the panel renders the take-it-or-leave-it
+// Fills zone below the track list and wires kit sound-follow into every
+// sound-swap path.
+import { parseFills, fillMemberDbIds, fillKey } from './src/fills/fill-meta';
+import {
+  generateAndMaterializeFill,
+  regenerateFill,
+  deleteFill,
+  regroupAllFills,
+  FillGenerationError,
+  type FillSourceTrack,
+  type MaterializeFillContext,
+} from './src/fills/materialize-fills';
+import { applyFillSoundFollow } from './src/fills/fill-sound-follow';
 import { SamplePackCTACard, type SamplePackCardInfo } from '@signalsandsorcery/plugin-sdk';
 
 type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
@@ -145,6 +161,27 @@ interface ResolvedCrossfadePair extends CrossfadePairMeta {
 /** A fade (transition orphan) resolved against live track state. */
 interface ResolvedFade extends FadeEntry {
   track: DrumTrackState;
+}
+
+/**
+ * A fill (one alt-track UNIT) resolved against live track state — rendered
+ * as one compact take-it-or-leave-it row in the Fills zone. Fill member
+ * tracks get NO TrackRow, drawer, piano roll, or faders by design.
+ */
+interface FillRowState {
+  fillId: string;
+  name: string;
+  prompt: string | null;
+  unitOrder: number;
+  members: Array<{
+    handle: PluginTrackHandle;
+    role: string;
+    sourceTrackDbId: string;
+    muted: boolean;
+  }>;
+  /** A member lost its source groove track and no same-role replacement exists. */
+  orphaned: boolean;
+  busy: boolean;
 }
 
 export function DrumGeneratorPanel({
@@ -239,6 +276,9 @@ export function DrumGeneratorPanel({
       const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       if (activeSceneId) {
         host.setSceneData(activeSceneId, `track:${dbId}:samplePath`, samplePath).catch(() => {});
+        // Fills borrowing this track's sound follow it (fire-and-forget —
+        // the primary swap never waits on a fill).
+        void applyFillSoundFollow(host, activeSceneId, dbId, samplePath);
       }
       setTracks((prev) => prev.map((t) => (t.handle.id === trackId ? { ...t, samplePath } : t)));
     },
@@ -260,6 +300,18 @@ export function DrumGeneratorPanel({
   // summed output. Feature-gated — hidden entirely on hosts without the
   // bus surface.
   const panelBus = usePanelBus(host, activeSceneId);
+  // --- Drum fills (compact rows below the track list; one plays per loop) ---
+  const [fills, setFills] = useState<FillRowState[]>([]);
+  const [isAddingFill, setIsAddingFill] = useState(false);
+  const [fillPromptOpenFor, setFillPromptOpenFor] = useState<string | null>(null);
+  const [fillPromptText, setFillPromptText] = useState('');
+  // Combined groove+fill member count for the shared 16-track ceiling — a
+  // ref so the existing budget gates stay dependency-free (refs are always
+  // current when a click handler runs).
+  const fillMemberCountRef = useRef(0);
+  // Builtins ship in lockstep with the host, so the presence of the alt
+  // surface implies unit support (SDK 3.10.0).
+  const fillsSupported = typeof host.groupTrackAlternatives === 'function';
 
 
   // Drag-to-reorder rows (shared SDK hook; persists per-scene by stable dbId).
@@ -517,9 +569,62 @@ export function DrumGeneratorPanel({
       // opening the Edit tab skips the engine refetch and shows an empty piano
       // roll even though the MIDI is safe in the engine + DB. Preserving the
       // buffer keeps editLoadStartedRef and editNotes consistent.
+      // Fills: split fill member tracks out of the row list — they render as
+      // compact fill rows below the track list, never as TrackRows. The
+      // sampler RE-ARM loop above already covered them (it iterates every
+      // handle), so fills keep sounding after reopen.
+      const parsedFills = parseFills(sceneData);
+      const fillDbIds = fillMemberDbIds(parsedFills);
+      const grooveStates = trackStates.filter(ts => !fillDbIds.has(ts.handle.dbId));
+      const stateByDbId = new Map(trackStates.map(ts => [ts.handle.dbId, ts]));
+      const fillRows: FillRowState[] = [];
+      for (const parsed of parsedFills) {
+        const members: FillRowState['members'] = [];
+        let orphaned = false;
+        for (const m of parsed.members) {
+          const ts = stateByDbId.get(m.dbId);
+          if (!ts) continue; // track vanished out-of-band — drops out of the parse
+          let sourceTrackDbId = m.meta.sourceTrackDbId;
+          const sourceAlive = grooveStates.some(g => g.handle.dbId === sourceTrackDbId);
+          if (!sourceAlive) {
+            // Rebind to the first groove track with the member's stored role;
+            // follow its sound immediately so the fill keeps tracking the kit.
+            const replacement = grooveStates.find(g => g.role === m.meta.role);
+            if (replacement) {
+              sourceTrackDbId = replacement.handle.dbId;
+              host.setSceneData(sceneAtStart, fillKey(m.dbId), { ...m.meta, sourceTrackDbId }).catch(() => {});
+              if (replacement.samplePath) {
+                host.setTrackDrumKit(ts.handle.id, { samplePath: replacement.samplePath }).catch(() => {});
+              }
+            } else {
+              orphaned = true;
+            }
+          }
+          members.push({
+            handle: ts.handle,
+            role: m.meta.role,
+            sourceTrackDbId,
+            muted: ts.runtimeState.muted,
+          });
+        }
+        if (members.length > 0) {
+          fillRows.push({
+            fillId: parsed.fillId,
+            name: parsed.name,
+            prompt: parsed.prompt,
+            unitOrder: parsed.unitOrder,
+            members,
+            orphaned,
+            busy: false,
+          });
+        }
+      }
+      setFills(fillRows);
+      fillMemberCountRef.current = fillRows.reduce((n, f) => n + f.members.length, 0);
+
       setTracks(prev => {
         const prevByDbId = new Map(prev.map(p => [p.handle.dbId, p]));
-        return trackStates.map(ts => {
+        return grooveStates.map(ts => {
           const carry = prevByDbId.get(ts.handle.dbId);
           return carry
             ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm, editBeatsPerBar: carry.editBeatsPerBar }
@@ -528,7 +633,7 @@ export function DrumGeneratorPanel({
       });
       // Restore persisted history (survives reopen); else seed the loaded sample
       // so the first shuffle's "previous" sound + the History tab have a baseline.
-      for (const ts of trackStates) {
+      for (const ts of grooveStates) {
         const persisted = sceneData[`track:${ts.handle.dbId}:soundHistory`];
         if (persisted && typeof persisted === 'object') {
           soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
@@ -551,7 +656,7 @@ export function DrumGeneratorPanel({
         const storedSig = sceneData[HAT_GROUP_SIG_KEY];
         if (typeof storedSig === 'string' && storedSig.length > 0) {
           const currentSig = computeHatGroupSig(
-            trackStates.flatMap(ts => {
+            grooveStates.flatMap(ts => {
               const articulation = hatArticulationForRole(ts.role);
               return articulation ? [{ handle: ts.handle, articulation }] : [];
             }),
@@ -565,7 +670,7 @@ export function DrumGeneratorPanel({
         const storedTomSig = sceneData[TOM_GROUP_SIG_KEY];
         if (typeof storedTomSig === 'string' && storedTomSig.length > 0) {
           const currentTomSig = computeTomGroupSig(
-            trackStates.flatMap(ts => {
+            grooveStates.flatMap(ts => {
               const tomRole = normalizeTomRole(ts.role);
               return tomRole ? [{ handle: ts.handle, role: tomRole }] : [];
             }),
@@ -796,7 +901,7 @@ export function DrumGeneratorPanel({
       host.showToast('warning', 'Sign In Required', 'Please sign in to add tracks');
       return;
     }
-    if (tracks.length >= MAX_TRACKS) return;
+    if (tracks.length + fillMemberCountRef.current >= MAX_TRACKS) return;
 
     isAddingTrackRef.current = true;
     setIsAddingTrack(true);
@@ -857,7 +962,7 @@ export function DrumGeneratorPanel({
     async (sel: { sourceTrackDbId: string; trackName: string; role?: string }): Promise<void> => {
       if (!activeSceneId) { host.showToast('warning', 'Select SCENE'); return; }
       if (!isConnected) { host.showToast('warning', 'Systems not connected'); return; }
-      if (tracks.length >= MAX_TRACKS) { host.showToast('warning', 'Track limit reached'); return; }
+      if (tracks.length + fillMemberCountRef.current >= MAX_TRACKS) { host.showToast('warning', 'Track limit reached'); return; }
       if (!host.readImportableTrackMidi) return;
       let handle: PluginTrackHandle | null = null;
       try {
@@ -943,7 +1048,7 @@ export function DrumGeneratorPanel({
       if (!scene) throw new Error('No active scene.');
       if (!isConnected) throw new Error('Systems not connected.');
       if (!isAuthenticated) throw new Error('Please sign in to generate the bridge.');
-      if (tracks.length + 2 > MAX_TRACKS) throw new Error('Not enough track slots for a crossfade.');
+      if (tracks.length + fillMemberCountRef.current + 2 > MAX_TRACKS) throw new Error('Not enough track slots for a crossfade.');
 
       setIsCreatingCrossfade(true);
       const created: PluginTrackHandle[] = [];
@@ -1064,7 +1169,7 @@ export function DrumGeneratorPanel({
       if (!scene) throw new Error('No active scene.');
       if (!isConnected) throw new Error('Systems not connected.');
       if (!isAuthenticated) throw new Error('Please sign in to generate the fade.');
-      if (tracks.length + 1 > MAX_TRACKS) throw new Error('Not enough track slots for a fade.');
+      if (tracks.length + fillMemberCountRef.current + 1 > MAX_TRACKS) throw new Error('Not enough track slots for a fade.');
 
       setIsCreatingFade(true);
       const created: PluginTrackHandle[] = [];
@@ -1232,7 +1337,7 @@ export function DrumGeneratorPanel({
       needsContract ||
       !isConnected ||
       !activeSceneId ||
-      tracks.length >= MAX_TRACKS ||
+      tracks.length + fillMemberCountRef.current >= MAX_TRACKS ||
       isAddingTrack;
 
     onHeaderContent(
@@ -1354,6 +1459,147 @@ export function DrumGeneratorPanel({
       host.showToast('error', 'Failed to delete track', msg);
     }
   }, [host, activeSceneId, runHatInterplay, runTomInterplay]);
+
+  // --- Drum fills: generate / regenerate / delete -----------------------
+  // Take-it-or-leave-it: a fill is kept, regenerated whole (optional
+  // prompt), or deleted. No per-member control surface by design.
+  const grooveSourceTracks = useCallback((): FillSourceTrack[] =>
+    tracks
+      .filter(t => t.role)
+      .map(t => ({
+        dbId: t.handle.dbId,
+        engineTrackId: t.handle.id,
+        role: t.role,
+        samplePath: t.samplePath,
+      })),
+    [tracks]);
+
+  const buildFillContext = useCallback(async (prompt: string | null): Promise<MaterializeFillContext> => {
+    if (!activeSceneId) throw new Error('No active scene');
+    const mc = await host.getMusicalContext();
+    // Pin the whole groove as budget-exempt reference — the fill answers it.
+    const pinTrackDbIds = tracks.filter(t => t.hasMidi).map(t => t.handle.dbId);
+    const genCtx = await host.getGenerationContext(
+      undefined,
+      pinTrackDbIds.length > 0 ? { pinTrackDbIds } : undefined,
+    );
+    const sceneData = await host.getAllSceneData(activeSceneId) as Record<string, unknown>;
+    return {
+      sceneId: activeSceneId,
+      mc,
+      grooveTracks: grooveSourceTracks(),
+      concurrentBlock: formatConcurrentTracks(genCtx),
+      existingFills: parseFills(sceneData),
+      prompt,
+      currentTrackCount: tracks.length + fillMemberCountRef.current,
+      maxTracks: MAX_TRACKS,
+    };
+  }, [host, activeSceneId, tracks, grooveSourceTracks]);
+
+  // Re-apply the unit grouping over ALL fills (idempotent; a lone fill stays
+  // ungrouped and simply plays every loop).
+  const regroupFillsFromScene = useCallback(async (): Promise<void> => {
+    if (!activeSceneId) return;
+    const sceneData = await host.getAllSceneData(activeSceneId) as Record<string, unknown>;
+    const parsed = parseFills(sceneData);
+    const handles = await host.getPluginTracks();
+    const engineByDb = new Map(handles.map(h => [h.dbId, h.id]));
+    await regroupAllFills(host, parsed.map(f => ({
+      memberEngineIds: f.members
+        .map(m => engineByDb.get(m.dbId))
+        .filter((id): id is string => typeof id === 'string'),
+    })));
+  }, [host, activeSceneId]);
+
+  const handleGenerateFills = useCallback(async (count: number, prompt: string | null): Promise<void> => {
+    if (!activeSceneId || isAddingFill) return;
+    if (!isAuthenticated) {
+      host.showToast('warning', 'Sign In Required', 'Please sign in to generate fills');
+      return;
+    }
+    setIsAddingFill(true);
+    try {
+      let generated = 0;
+      for (let i = 0; i < count; i++) {
+        try {
+          // Context rebuilt per fill: existingFills grows, so each call's
+          // variety block sees the fills generated before it.
+          const ctx = await buildFillContext(prompt);
+          await generateAndMaterializeFill(host, ctx);
+          generated += 1;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          host.showToast('error', 'Fill generation failed', msg);
+          // Out of track slots — no point retrying; earlier fills stand.
+          if (err instanceof FillGenerationError && msg.includes('track slots')) break;
+        }
+      }
+      if (generated > 0) {
+        await regroupFillsFromScene();
+        await loadTracks(true);
+        host.showToast('success', generated === 1 ? 'Fill generated' : `${generated} fills generated`);
+      }
+    } finally {
+      setIsAddingFill(false);
+    }
+  }, [host, activeSceneId, isAddingFill, isAuthenticated, buildFillContext, regroupFillsFromScene, loadTracks]);
+
+  const handleRegenerateFill = useCallback(async (fillId: string, prompt: string | null): Promise<void> => {
+    if (!activeSceneId) return;
+    setFills(prev => prev.map(f => (f.fillId === fillId ? { ...f, busy: true } : f)));
+    try {
+      const ctx = await buildFillContext(prompt);
+      const parsed = ctx.existingFills.find(f => f.fillId === fillId);
+      if (!parsed) throw new Error('Fill no longer exists — reload the scene');
+      const handles = await host.getPluginTracks();
+      const engineByDb = new Map(handles.map(h => [h.dbId, h.id]));
+      await regenerateFill(host, ctx, parsed, engineByDb);
+      await regroupFillsFromScene();
+      await loadTracks(true);
+      host.showToast('success', 'Fill regenerated');
+    } catch (err) {
+      host.showToast('error', 'Fill regeneration failed', err instanceof Error ? err.message : String(err));
+      setFills(prev => prev.map(f => (f.fillId === fillId ? { ...f, busy: false } : f)));
+    }
+  }, [host, activeSceneId, buildFillContext, regroupFillsFromScene, loadTracks]);
+
+  const handleDeleteFill = useCallback(async (fill: FillRowState): Promise<void> => {
+    if (!activeSceneId) return;
+    setFills(prev => prev.map(f => (f.fillId === fill.fillId ? { ...f, busy: true } : f)));
+    try {
+      await deleteFill(
+        host,
+        activeSceneId,
+        fill.members.map(m => ({ dbId: m.handle.dbId, engineTrackId: m.handle.id })),
+      );
+      await loadTracks(true);
+    } catch (err) {
+      host.showToast('error', 'Failed to delete fill', err instanceof Error ? err.message : String(err));
+      setFills(prev => prev.map(f => (f.fillId === fill.fillId ? { ...f, busy: false } : f)));
+    }
+  }, [host, activeSceneId, loadTracks]);
+
+  // Fill ● indicators ride the engine's own trackStateChanged push — the
+  // per-loop rotation flips ENGINE mutes without any mutations broadcast
+  // (deliberate; see alt-track-playback-service).
+  useEffect(() => {
+    if (typeof host.onTrackStateChange !== 'function') return;
+    const unsubscribe = host.onTrackStateChange((trackId, state) => {
+      setFills(prev => {
+        let changed = false;
+        const next = prev.map(f => {
+          const idx = f.members.findIndex(m => m.handle.id === trackId);
+          if (idx === -1 || f.members[idx].muted === state.muted) return f;
+          changed = true;
+          const members = [...f.members];
+          members[idx] = { ...members[idx], muted: state.muted };
+          return { ...f, members };
+        });
+        return changed ? next : prev;
+      });
+    });
+    return unsubscribe;
+  }, [host]);
 
   // --- Crossfade group controls -----------------------------------------
   // Mute/solo act on BOTH layers together; per-layer volume/pan reuse the normal
@@ -1588,6 +1834,10 @@ export function DrumGeneratorPanel({
           }
           try {
             await host.setTrackDrumKit(trackId, { samplePath: picked });
+            // Fills borrowing this track's sound follow the fresh pick.
+            if (activeSceneId) {
+              void applyFillSoundFollow(host, activeSceneId, genDbId, picked);
+            }
           } catch (err) {
             console.warn('[DrumGeneratorPanel] setTrackDrumKit failed:', err);
           }
@@ -1758,6 +2008,10 @@ export function DrumGeneratorPanel({
         host.setSceneData(activeSceneId, `track:${dbId}:samplePath`, picked).catch(() => {});
       }
       await host.setTrackDrumKit(trackId, { samplePath: picked });
+      // Fills borrowing this track's sound follow the shuffle.
+      if (activeSceneId) {
+        void applyFillSoundFollow(host, activeSceneId, dbId, picked);
+      }
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId ? { ...t, samplePath: picked, shuffleHistory: nextHistory } : t
       ));
@@ -2326,6 +2580,47 @@ export function DrumGeneratorPanel({
         </>
       ))}
 
+      {/* ── FILLS — below all drum tracks, behind a visual divider ── */}
+      {!designerView && !isLoadingTracks && !isTransitionScene && fillsSupported && tracks.length > 0 && (
+        <div className="mt-3 pt-2 border-t border-sas-border/70" data-testid="drum-fills-zone">
+          <div className="flex items-center justify-between mb-1.5">
+            <span
+              className="text-[10px] uppercase tracking-wide font-semibold"
+              style={{ color: DRUM_ACCENT_COLOR, opacity: 0.75 }}
+              title="Pre-generated fills built from this kit's sounds — exactly one plays per loop pass, rotating"
+            >
+              Fills · one per loop
+            </span>
+            <button
+              data-testid="drum-fills-add"
+              onClick={() => { void handleGenerateFills(1, null); }}
+              disabled={
+                isAddingFill ||
+                tracks.length + fillMemberCountRef.current >= MAX_TRACKS ||
+                !tracks.some(t => t.hasMidi && t.role)
+              }
+              className="px-1.5 py-0.5 text-[10px] rounded-sm border border-sas-border text-sas-muted hover:text-sas-accent hover:border-sas-accent disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Generate one more fill from the current groove"
+            >
+              {isAddingFill ? 'Generating…' : '＋ Add fill'}
+            </button>
+          </div>
+          {fills.length === 0 ? (
+            <button
+              data-testid="drum-fills-cta"
+              onClick={() => { void handleGenerateFills(3, null); }}
+              disabled={isAddingFill || !tracks.some(t => t.hasMidi && t.role)}
+              className="w-full px-2 py-1.5 text-[10px] uppercase tracking-wide rounded-sm border border-dashed border-sas-border text-sas-muted hover:text-sas-accent hover:border-sas-accent disabled:opacity-40 disabled:cursor-not-allowed"
+              title={tracks.some(t => t.hasMidi && t.role) ? 'Generate 3 rotating fills from the current groove' : 'Generate a drum groove first'}
+            >
+              {isAddingFill ? 'Generating fills…' : 'Generate 3 fills'}
+            </button>
+          ) : (
+            <div className="space-y-1">{fills.map(renderFillRow)}</div>
+          )}
+        </div>
+      )}
+
       {!designerView && !isLoadingTracks && tracks.length > 0 && (() => {
         const hasAnyMidi = tracks.some(t => t.hasMidi);
         const exportDisabled = isExportingMidi || !hasAnyMidi;
@@ -2355,6 +2650,102 @@ export function DrumGeneratorPanel({
       })()}
     </div>
   );
+
+  function renderFillRow(fill: FillRowState): React.ReactElement {
+    const audible = fill.members.some(m => !m.muted);
+    const promptOpen = fillPromptOpenFor === fill.fillId;
+    return (
+      <div
+        key={fill.fillId}
+        data-testid={`drum-fill-row-${fill.fillId}`}
+        className="rounded-sm border border-sas-border/60 bg-sas-bg/40 px-2 py-1"
+      >
+        <div className="flex items-center gap-2">
+          <span
+            className="text-[9px] shrink-0"
+            style={{ color: audible ? DRUM_ACCENT_COLOR : '#555' }}
+            title={audible ? 'Plays this loop pass' : 'Waiting its turn in the rotation'}
+          >
+            ●
+          </span>
+          <span className="text-[11px] text-sas-text truncate shrink-0 max-w-[35%]" title={fill.prompt ?? undefined}>
+            {fill.name}
+          </span>
+          <div className="flex items-center gap-1 flex-1 min-w-0 overflow-hidden">
+            {fill.members.map(m => {
+              const source = tracks.find(t => t.handle.dbId === m.sourceTrackDbId);
+              const soundLabel = source?.samplePath ? sampleNameForDisplay(source.samplePath) : null;
+              return (
+                <span
+                  key={m.handle.dbId}
+                  className="px-1 py-0.5 text-[9px] rounded-sm bg-sas-border/40 text-sas-muted truncate"
+                  title={`${m.role} · borrows ${source ? source.handle.name : 'a missing source'}`}
+                >
+                  {m.role}
+                  {soundLabel ? ` · ${soundLabel}` : ''}
+                </span>
+              );
+            })}
+            {fill.orphaned && (
+              <span
+                className="px-1 py-0.5 text-[9px] rounded-sm bg-amber-900/40 text-amber-400 shrink-0"
+                title="A source track was deleted — regenerate to rebind the fill to the current kit"
+              >
+                ⚠ source missing
+              </span>
+            )}
+          </div>
+          <button
+            data-testid={`drum-fill-regen-${fill.fillId}`}
+            onClick={() => {
+              setFillPromptOpenFor(promptOpen ? null : fill.fillId);
+              setFillPromptText(fill.prompt ?? '');
+            }}
+            disabled={fill.busy}
+            className="px-1 text-[11px] text-sas-muted hover:text-sas-accent disabled:opacity-40 shrink-0"
+            title="Regenerate this whole fill (optionally describe it)"
+          >
+            {fill.busy ? '…' : '⟳'}
+          </button>
+          <button
+            data-testid={`drum-fill-delete-${fill.fillId}`}
+            onClick={() => { void handleDeleteFill(fill); }}
+            disabled={fill.busy}
+            className="px-1 text-[11px] text-sas-muted hover:text-red-400 disabled:opacity-40 shrink-0"
+            title="Delete this fill"
+          >
+            ✕
+          </button>
+        </div>
+        {promptOpen && (
+          <div className="flex items-center gap-1 mt-1">
+            <input
+              value={fillPromptText}
+              onChange={e => setFillPromptText(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  setFillPromptOpenFor(null);
+                  void handleRegenerateFill(fill.fillId, fillPromptText.trim() || null);
+                }
+              }}
+              placeholder="Describe the fill (optional) — Enter to regenerate"
+              className="flex-1 bg-sas-bg border border-sas-border rounded-sm px-1.5 py-0.5 text-[10px] text-sas-text placeholder:text-sas-muted/50"
+              autoFocus
+            />
+            <button
+              onClick={() => {
+                setFillPromptOpenFor(null);
+                void handleRegenerateFill(fill.fillId, fillPromptText.trim() || null);
+              }}
+              className="px-1.5 py-0.5 text-[10px] rounded-sm border border-sas-border text-sas-muted hover:text-sas-accent"
+            >
+              Go
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   function renderTrackRow(track: DrumTrackState, drag?: TrackRowDragProps): React.ReactElement {
     return (
