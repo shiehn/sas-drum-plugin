@@ -622,12 +622,26 @@ export function DrumGeneratorPanel({
       setFills(fillRows);
       fillMemberCountRef.current = fillRows.reduce((n, f) => n + f.members.length, 0);
 
+      // Carry forward the in-memory piano-roll edit buffer AND the drawer's
+      // view state (open / tab / editor stage) for tracks that still exist,
+      // matched by stable DB UUID. A reload is a data refresh, not a UI reset —
+      // an agent mutation fired while the Edit-tab piano roll was open must
+      // not slam every drawer shut.
       setTracks(prev => {
         const prevByDbId = new Map(prev.map(p => [p.handle.dbId, p]));
         return grooveStates.map(ts => {
           const carry = prevByDbId.get(ts.handle.dbId);
           return carry
-            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm, editBeatsPerBar: carry.editBeatsPerBar }
+            ? {
+                ...ts,
+                editNotes: carry.editNotes,
+                editBars: carry.editBars,
+                editBpm: carry.editBpm,
+                editBeatsPerBar: carry.editBeatsPerBar,
+                drawerOpen: carry.drawerOpen,
+                drawerTab: carry.drawerTab,
+                editorStage: carry.editorStage,
+              }
             : ts;
         });
       });
