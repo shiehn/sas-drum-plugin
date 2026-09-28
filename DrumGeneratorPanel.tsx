@@ -73,6 +73,8 @@ import {
   type MaterializeFillContext,
 } from './src/fills/materialize-fills';
 import { applyFillSoundFollow } from './src/fills/fill-sound-follow';
+// S-037: one load-time sampler re-arm in flight per track (see the module).
+import { createRearmSingleFlight } from './src/rearm-single-flight';
 import { SamplePackCTACard, type SamplePackCardInfo } from '@signalsandsorcery/plugin-sdk';
 
 type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
@@ -430,6 +432,20 @@ export function DrumGeneratorPanel({
   }, [kitResolver, packStatus, userPackCount]);
 
   // --- Load tracks when scene changes -----------------------------------
+  // S-037: loadTracks fires from many overlapping triggers, and each pass
+  // re-arms every track's sampler. Un-awaited, they raced: 2-3 re-arms of one
+  // track within a second, one of which met a plugin list that timed out
+  // during a save and made the host add a duplicate Sampler. The coordinator
+  // keeps one re-arm in flight per track (a same-path request joins it, a
+  // changed path waits as one trailing re-arm, a failure clears the entry).
+  // Plugin-local: no new host surface, so older hosts are unaffected.
+  const [drumRearm] = useState(() =>
+    createRearmSingleFlight({
+      onError: (err: unknown) => {
+        console.warn('[DrumGeneratorPanel] Failed to re-arm sampler on load:', err);
+      },
+    }),
+  );
   const tracksLoadedForSceneRef = useRef<string | null>(null);
   const loadTracks = useCallback(async (incremental = false): Promise<void> => {
     const sceneAtStart = activeSceneId;
@@ -530,9 +546,9 @@ export function DrumGeneratorPanel({
         // it, every scene switch auto-unfroze frozen drum tracks (the host's
         // freeze gate treats a kit set as an audible edit).
         if (samplePath) {
-          host.setTrackDrumKit(handle.id, { samplePath, restore: true }).catch((err: unknown) => {
-            console.warn('[DrumGeneratorPanel] Failed to re-arm sampler on load:', err);
-          });
+          drumRearm.request(handle.id, samplePath, (path: string) =>
+            host.setTrackDrumKit(handle.id, { samplePath: path, restore: true }),
+          );
         }
 
         trackStates.push({
@@ -660,6 +676,13 @@ export function DrumGeneratorPanel({
       if (tracksLoadedForSceneRef.current === sceneAtStart) {
         setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
         setFadesMeta(parseFades(sceneData));
+        // The host routes a panel's tracks into its scene bus only inside a
+        // bus read, so re-read now that the track set is known: tracks that
+        // import / crossfade / fills / duplicate just created (all end here)
+        // join the bus at once, not on the next scene switch (S-027 G1,
+        // SDK 3.19.0). Stable + coalesced, so it is safe in the deps below;
+        // optional because an app on an older SDK has no notifier.
+        panelBus.notifyTracksChanged?.();
       }
       // Hat-interplay reconcile: only for scenes the feature already manages
       // (a stored group signature exists). If membership changed while the
@@ -701,7 +724,7 @@ export function DrumGeneratorPanel({
         setIsLoadingTracks(false);
       }
     }
-  }, [host, activeSceneId, soundHistory]);
+  }, [host, activeSceneId, soundHistory, panelBus.notifyTracksChanged, drumRearm]);
 
   useEffect(() => {
     loadTracks();
@@ -832,10 +855,14 @@ export function DrumGeneratorPanel({
 
   useEffect(() => {
     const unsub = host.onEngineReady(() => {
+      // The engine (re)loaded the project: samplers are new and engine ids may
+      // have moved, so a re-arm still in flight no longer covers this load's
+      // same-path request. It runs as the trailing re-arm instead (S-037).
+      drumRearm.invalidate();
       adoptAndLoad();
     });
     return unsub;
-  }, [host, adoptAndLoad]);
+  }, [host, adoptAndLoad, drumRearm]);
 
   useEffect(() => {
     if (typeof host.onAfterAgentMutation !== 'function') return;
@@ -950,6 +977,11 @@ export function DrumGeneratorPanel({
         instrumentMissing: false,
       };
       setTracks(prev => [...prev, newTrack]);
+      // Add Track appends locally (no loadTracks), so ask for the bus re-read
+      // here: the new track joins the scene bus now (S-027 G1, SDK 3.19.0).
+      // Optional: on an older SDK a throw here would surface as a false
+      // "Failed to create track" toast.
+      panelBus.notifyTracksChanged?.();
       onExpandSelf?.();
       setTimeout(() => {
         const inputs = document.querySelectorAll<HTMLInputElement>('[data-testid="drum-section"] [data-testid="sdk-prompt-input"]');
@@ -964,7 +996,7 @@ export function DrumGeneratorPanel({
       isAddingTrackRef.current = false;
       setIsAddingTrack(false);
     }
-  }, [host, activeSceneId, isConnected, isAuthenticated, tracks.length, onExpandSelf]);
+  }, [host, activeSceneId, isConnected, isAuthenticated, tracks.length, onExpandSelf, panelBus.notifyTracksChanged]);
 
   // Cross-panel import ("re-sound a part on drums"): pull a MIDI part out of a
   // track owned by ANOTHER panel in THIS scene and trigger it through a drum
