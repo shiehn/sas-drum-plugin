@@ -2798,7 +2798,7 @@ export function DrumGeneratorPanel({
       <TrackRow
         key={track.handle.id}
         drag={drag}
-        track={{ id: track.handle.id, name: track.handle.name, role: track.role }}
+        track={{ id: track.handle.id, name: track.handle.name, role: track.role, dbId: track.handle.dbId }}
         levels={supportsMeters ? trackLevels : undefined}
         prompt={track.prompt}
         runtimeState={{
